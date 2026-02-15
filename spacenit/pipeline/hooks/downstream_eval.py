@@ -1,0 +1,826 @@
+"""Downstream evaluation hook for the SpaceNit pipeline."""
+
+import gc
+import logging
+import os
+import random
+import time
+from dataclasses import dataclass, field
+from enum import StrEnum
+from functools import partial
+from typing import Any
+
+import numpy as np
+import torch
+from olmo_core.train.callbacks.callback import Callback, CallbackConfig
+from olmo_core.train.common import Duration
+from olmo_core.train.trainer import Trainer
+from torch.utils.data import DataLoader
+
+from spacenit.ingestion.sensors import SensorRegistry
+from spacenit.evals.datasets import (
+    EvalDatasetPartition,
+    get_eval_dataset,
+)
+from spacenit.evals.datasets.configs import (
+    EvalDatasetConfig,
+    TaskType,
+    dataset_to_config,
+    get_eval_mode,
+)
+from spacenit.evals.datasets.normalize import NormMethod
+from spacenit.evals.datasets.utils import eval_collate_fn
+from spacenit.evals.embedding_transforms import (
+    dequantize_embeddings,
+    reduce_embedding_dim,
+)
+from spacenit.evals.embeddings import get_embeddings
+from spacenit.evals.eval_wrapper import get_eval_wrapper
+from spacenit.evals.finetune import run_finetune_eval
+from spacenit.evals.knn import run_knn
+from spacenit.evals.linear_probe import ProbeType, train_and_eval_probe
+from spacenit.evals.metrics import EvalResult, EvalTaskResult
+from spacenit.arch.adaptive_vision_encoder import PoolingType
+from spacenit.pipeline.hooks.experiment_logger import SpaceNitExperimentLogger
+
+logger = logging.getLogger(__name__)
+
+
+def _seed_worker(worker_id: int, base_seed: int) -> None:
+    """Seed DataLoader worker RNGs deterministically."""
+    worker_seed = base_seed + worker_id
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+
+
+class EvalMode(StrEnum):
+    """Eval mode."""
+
+    KNN = "knn"
+    LINEAR_PROBE = "linear_probe"
+    FINETUNE = "finetune"
+
+
+@dataclass
+class DownstreamTaskConfig:
+    """Config for a downstream task."""
+
+    dataset: str
+    num_workers: int = 8
+    pooling_type: str = PoolingType.MEAN
+    norm_stats_from_pretrained: bool = True
+    # Only for multimodal tasks, e.g. pastis, nandi, awf
+    input_modalities: list[str] = field(default_factory=list)
+    # Only for rslearn datasets, e.g. nandi, awf
+    input_layers: list[str] = field(default_factory=list)
+    # LP / KNN (embedding-based)
+    embedding_batch_size: int = 128
+    # LP
+    probe_lr: float | None = None
+    probe_batch_size: int = 32
+    linear_probe_eval_interval: int = 50  # calculate val results every N epochs
+    # FT
+    ft_lr: float | None = None
+    ft_batch_size: int = 32
+    finetune_seed: int = 42
+    # LP / FT
+    epochs: int = 50
+    # LP / KNN / FT
+    patch_size: int = 4
+    eval_interval: Duration = field(default_factory=lambda: Duration.epochs(1))
+    eval_mode: EvalMode | None = None
+    probe_type: ProbeType = ProbeType.LINEAR
+    use_pooled_tokens: bool = False
+    partition: str = field(default_factory=lambda: EvalDatasetPartition.TRAIN1X)
+    norm_method: NormMethod = field(default_factory=lambda: NormMethod.NORM_NO_CLIP)
+    select_final_test_miou_based_on_epoch_of_max_val_miou: bool = False
+    # Quantize embeddings to int8 for storage efficiency evaluation
+    quantize_embeddings: bool = False
+    # Reduce embedding dimensionality via PCA (None = no reduction)
+    embedding_dim: int | None = None
+
+
+class DownstreamEvalRunner:
+    """Runner for downstream evaluation tasks."""
+
+    def __init__(
+        self,
+        evaluation_name: str,
+        task: DownstreamTaskConfig,
+        trainer: Trainer,
+        device: torch.device | None = None,
+        run_on_test: bool = False,
+        n_bootstrap: int = 0,
+        bootstrap_seed: int = 42,
+    ) -> None:
+        """Initialize the downstream evaluation runner.
+
+        Args:
+            evaluation_name: Name of the evaluation.
+            task: Task configuration.
+            trainer: Trainer object.
+            device: Device to evaluate on.
+            run_on_test: Whether to run the evaluators on the val set
+                only (=False) or on the test and val set (=True)
+            n_bootstrap: Number of bootstrap samples for uncertainty estimation (0 = no bootstrap)
+            bootstrap_seed: Random seed for bootstrap sampling
+        """
+        self.evaluation_name = evaluation_name
+        self.config = dataset_to_config(task.dataset)
+        self.trainer = trainer
+        self.device = device
+        # Add all task attributes to self
+        self.dataset = task.dataset
+        self.embedding_batch_size = task.embedding_batch_size
+        self.num_workers = task.num_workers
+        self.pooling_type = task.pooling_type
+        self.norm_stats_from_pretrained = task.norm_stats_from_pretrained
+        self.input_modalities = task.input_modalities
+        self.input_layers = task.input_layers
+        self.probe_lr = task.probe_lr
+        self.probe_batch_size = task.probe_batch_size
+        self.ft_lr = task.ft_lr
+        self.ft_batch_size = task.ft_batch_size
+        self.finetune_seed = task.finetune_seed
+        self.epochs = task.epochs
+        self.linear_probe_eval_interval = task.linear_probe_eval_interval
+        self.patch_size = task.patch_size
+        self.eval_interval = task.eval_interval
+        self.eval_mode = task.eval_mode
+        self.probe_type = task.probe_type
+        self.partition = task.partition
+        self.norm_method = task.norm_method
+        self.use_pooled_tokens = task.use_pooled_tokens
+        self.select_final_test_miou_based_on_epoch_of_max_val_miou = (
+            task.select_final_test_miou_based_on_epoch_of_max_val_miou
+        )
+        self.quantize_embeddings = task.quantize_embeddings
+        self.embedding_dim = task.embedding_dim
+        self.run_on_test = run_on_test
+        self.n_bootstrap = n_bootstrap
+        self.bootstrap_seed = bootstrap_seed
+        if self.select_final_test_miou_based_on_epoch_of_max_val_miou:
+            assert self.run_on_test, (
+                "if select_final_test_miou_based_on_epoch_of_max_val_miou is True, "
+                "run_on_test must be True"
+            )
+        if self.eval_mode is None:
+            self.eval_mode = get_eval_mode(self.config.task_type)  # type: ignore
+        if isinstance(self.eval_mode, str) and self.eval_mode is not None:
+            self.eval_mode = EvalMode(self.eval_mode)
+
+        assert self.eval_mode in EvalMode, f"Unexpected eval mode {self.eval_mode}"
+
+        if self.eval_mode == EvalMode.LINEAR_PROBE:
+            if self.probe_lr is None:
+                raise ValueError("probe_lr cannot be none for segmentation tasks.")
+            if self.config.task_type == TaskType.SEGMENTATION:
+                if self.config.height_width is None:
+                    raise ValueError(
+                        "config.height_width cannot be none for segmentation tasks."
+                    )
+                if self.config.height_width % self.patch_size != 0:
+                    raise ValueError("Image height / width indivisible by patch size.")
+
+        if self.eval_mode == EvalMode.FINETUNE:
+            if self.ft_lr is None:
+                raise ValueError("ft_lr cannot be none for finetune tasks.")
+            if self.config.task_type == TaskType.SEGMENTATION:
+                if self.config.height_width is None:
+                    raise ValueError(
+                        "config.height_width cannot be none for segmentation tasks."
+                    )
+                if self.config.height_width % self.patch_size != 0:
+                    raise ValueError("Image height / width indivisible by patch size.")
+
+        self.eval_function = (
+            partial(
+                run_knn,
+            )
+            if self.eval_mode == EvalMode.KNN
+            else (
+                partial(
+                    train_and_eval_probe,
+                    batch_size=self.probe_batch_size,
+                    epochs=self.epochs,
+                    eval_interval=self.linear_probe_eval_interval,
+                    probe_type=self.probe_type,
+                    lr=self.probe_lr,
+                    select_final_test_miou_based_on_epoch_of_max_val_miou=self.select_final_test_miou_based_on_epoch_of_max_val_miou,
+                )
+                if self.eval_mode == EvalMode.LINEAR_PROBE
+                else None
+            )  # "finetune" handled explicitly below in .val()
+        )
+
+    def _get_data_loader(
+        self, split: str, batch_size: int, seed: int | None = None
+    ) -> DataLoader:
+        """Get the data loader for the given split."""
+        logger.info(
+            f"Getting data loader for {self.dataset} with norm method {self.norm_method} and norm stats from pretrained {self.norm_stats_from_pretrained}"
+        )
+
+        generator = None
+        worker_init_fn = None
+        if seed is not None:
+            split_offsets = {"train": 0, "valid": 1, "test": 2}
+            split_seed = seed + split_offsets.get(split, 0)
+            generator = torch.Generator()
+            generator.manual_seed(split_seed)
+            worker_init_fn = partial(_seed_worker, base_seed=split_seed)
+
+        return DataLoader(
+            get_eval_dataset(
+                eval_dataset=self.dataset,
+                split=split,
+                partition=self.partition,
+                norm_stats_from_pretrained=self.norm_stats_from_pretrained,
+                input_modalities=self.input_modalities,
+                input_layers=self.input_layers,
+                norm_method=self.norm_method,
+            ),
+            collate_fn=eval_collate_fn,
+            batch_size=batch_size,
+            num_workers=self.num_workers,
+            generator=generator,
+            worker_init_fn=worker_init_fn,
+            shuffle=(split == "train"),  # Only shuffle train data
+        )
+
+    def _get_embeddings(
+        self, data_loader: DataLoader, is_train: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get the embeddings for the given data loader."""
+        print(
+            f"Getting embeddings for {self.dataset} with norm method {self.norm_method}"
+        )
+        if hasattr(self.trainer.train_module.model, "encoder"):
+            model = self.trainer.train_module.model.encoder
+        else:
+            model = self.trainer.train_module.model
+
+        if hasattr(model, "patch_size"):
+            self.patch_size = model.patch_size
+            logger.info(
+                f"Using patch size {self.patch_size} for {self.dataset} with model patch size {model.patch_size} and task patch size {self.patch_size}"
+            )
+        else:
+            logger.info(
+                f"No patch size found from model for {self.dataset}, using task patch size {self.patch_size}"
+            )
+
+        wrapper_kwargs = {
+            "task_type": self.config.task_type,
+            "patch_size": self.patch_size,
+            "pooling_type": self.pooling_type,
+            "concat_features": (self.probe_type == "attn_pool"),
+            "use_pooled_tokens": self.use_pooled_tokens,
+        }
+        model = get_eval_wrapper(model, **wrapper_kwargs)
+        return get_embeddings(
+            data_loader=data_loader,
+            model=model,
+            is_train=is_train,
+            quantize=self.quantize_embeddings,
+        )
+
+    def _val_embed_probe(self) -> EvalTaskResult:
+        """Validate the model using embeddings and probe (knn or linear probe)."""
+        logger.info(f"Validating {self.dataset} with {self.eval_mode}")
+        train_loader = self._get_data_loader("train", self.embedding_batch_size)
+        val_loader = self._get_data_loader("valid", self.embedding_batch_size)
+        test_loader = self._get_data_loader("test", self.embedding_batch_size)
+
+        start_time = time.time()
+        logger.info(f"Getting train embeddings for {self.dataset}...")
+        train_embeddings, train_labels = self._get_embeddings(
+            train_loader, is_train=True
+        )
+        logger.info(f"Getting val embeddings for {self.dataset}...")
+        val_embeddings, val_labels = self._get_embeddings(val_loader, is_train=False)
+        if self.run_on_test:
+            logger.info(f"Getting test embeddings for {self.dataset}...")
+            test_embeddings, test_labels = self._get_embeddings(
+                test_loader, is_train=False
+            )
+        else:
+            test_embeddings, test_labels = None, None
+        logger.info(
+            f"Time to get embeddings for {self.dataset}: {time.time() - start_time:.2f}s"
+        )
+
+        logger.info(
+            f"train embeddings shape for {self.dataset}: {train_embeddings.shape}"
+        )
+        logger.info(f"val embeddings shape for {self.dataset}: {val_embeddings.shape}")
+        if test_embeddings is not None:
+            logger.info(
+                f"test embeddings shape for {self.dataset}: {test_embeddings.shape}"
+            )
+        logger.info(f"train labels shape for {self.dataset}: {train_labels.shape}")
+        logger.info(f"val labels shape for {self.dataset}: {val_labels.shape}")
+        if test_labels is not None:
+            logger.info(f"test labels shape for {self.dataset}: {test_labels.shape}")
+
+        # Dequantize if embeddings were quantized
+        if self.quantize_embeddings:
+            logger.info(f"Dequantizing embeddings for {self.dataset}")
+            train_embeddings = dequantize_embeddings(train_embeddings)
+            val_embeddings = dequantize_embeddings(val_embeddings)
+            if test_embeddings is not None:
+                test_embeddings = dequantize_embeddings(test_embeddings)
+
+        # Reduce embedding dimensionality via PCA if specified
+        if self.embedding_dim is not None:
+            original_dim = train_embeddings.shape[-1]
+            logger.info(
+                f"Reducing embeddings from {original_dim} to {self.embedding_dim} dims for {self.dataset}"
+            )
+            train_embeddings, val_embeddings, test_embeddings, variance_retained = (
+                reduce_embedding_dim(
+                    train_embeddings,
+                    val_embeddings,
+                    test_embeddings,
+                    self.embedding_dim,
+                )
+            )
+            logger.info(f"PCA variance retained: {variance_retained:.4f}")
+
+        kwargs = {
+            "config": self.config,
+            "train_embeddings": train_embeddings,
+            "train_labels": train_labels,
+            "val_embeddings": val_embeddings,
+            "val_labels": val_labels,
+            "test_embeddings": test_embeddings,
+            "test_labels": test_labels,
+            "device": self.device,
+            "n_bootstrap": self.n_bootstrap,
+            "bootstrap_seed": self.bootstrap_seed,
+        }
+        result = self.eval_function(**kwargs)  # type: ignore
+
+        # Free memory aggressively between evals
+        del train_embeddings, train_labels, test_embeddings, test_labels
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        return result
+
+    def _get_best_checkpoint_path(self) -> str:
+        """Get the best checkpoint path."""
+        best_checkpoint_path = os.path.join(
+            self.trainer.save_folder,
+            self.evaluation_name,
+            f"lr{self.ft_lr}",
+            "best.ckpt",
+        )
+        return best_checkpoint_path
+
+    def _get_resume_checkpoint_path(self) -> str:
+        """Get the resume checkpoint path for resumable training."""
+        resume_checkpoint_path = os.path.join(
+            self.trainer.save_folder,
+            self.evaluation_name,
+            f"lr{self.ft_lr}",
+            "last.ckpt",
+        )
+        return resume_checkpoint_path
+
+    def _val_finetune(self) -> EvalTaskResult:
+        """Validate the model using finetuning."""
+        logger.info(f"Validating {self.dataset} with finetune")
+
+        train_loader = self._get_data_loader(
+            "train", self.ft_batch_size, seed=self.finetune_seed
+        )
+        val_loader = self._get_data_loader("valid", self.ft_batch_size)
+
+        if self.run_on_test:
+            test_loader = self._get_data_loader("test", self.ft_batch_size)
+        else:
+            test_loader = None
+
+        if hasattr(self.trainer.train_module.model, "encoder"):
+            model = self.trainer.train_module.model.encoder
+        else:
+            model = self.trainer.train_module.model
+
+        original_state = {
+            k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+        }
+
+        if hasattr(model, "patch_size"):
+            logger.info(
+                f"Using patch size {max(self.patch_size, model.patch_size)} for {self.dataset}"
+                f" with model patch size {model.patch_size} and task patch size {self.patch_size}"
+                f" (max of {self.patch_size} and {model.patch_size})"
+            )
+            self.patch_size = max(self.patch_size, model.patch_size)
+        else:
+            logger.info(
+                f"No patch size found for {self.dataset}, using patch size {self.patch_size}"
+            )
+
+        best_checkpoint_path = self._get_best_checkpoint_path()
+        resume_checkpoint_path = self._get_resume_checkpoint_path()
+        if os.path.exists(best_checkpoint_path):
+            logger.info(
+                f"Best checkpoint for {self.evaluation_name} already exists, "
+                f"skipping finetuning and evaluating on the best checkpoint..."
+            )
+
+        if os.path.exists(resume_checkpoint_path):
+            logger.info(
+                f"Found resume checkpoint at {resume_checkpoint_path}, will resume training"
+            )
+        else:
+            logger.info("No resume checkpoint found, starting fresh")
+
+        result = run_finetune_eval(
+            task_name=self.evaluation_name,
+            task_config=self.config,
+            trainer=self.trainer,
+            model=model,
+            device=self.device or self.trainer.device,
+            lr=self.ft_lr,  # type: ignore
+            epochs=self.epochs,
+            patch_size=self.patch_size,
+            pooling_type=self.pooling_type,
+            use_pooled_tokens=self.use_pooled_tokens,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            seed=self.finetune_seed,
+            best_checkpoint_path=best_checkpoint_path,
+            resume_checkpoint_path=resume_checkpoint_path,
+        )
+        logger.info(
+            f"Downstream eval {self.evaluation_name} val score: {result.val_result}, test score: {result.test_result}"
+        )
+        model.load_state_dict(original_state)
+
+        torch.cuda.empty_cache()
+        gc.collect()
+        return result
+
+    def val(self) -> EvalTaskResult:
+        """Validate the model on the downstream task."""
+        if self.eval_mode in (EvalMode.KNN, EvalMode.LINEAR_PROBE):
+            return self._val_embed_probe()
+        elif self.eval_mode == EvalMode.FINETUNE:
+            return self._val_finetune()
+        else:
+            raise ValueError(f"Unsupported eval_mode: {self.eval_mode}")
+
+
+def _log_eval_result_to_wandb(
+    wandb_callback: Any, prefix: str, name: str, result: EvalResult
+) -> None:
+    """Log an EvalResult to wandb."""
+    for metric_name, metric_value in result.metrics.items():
+        wandb_callback.wandb.log({f"{prefix}/{name}/{metric_name}": metric_value})
+    wandb_callback.wandb.log({f"{prefix}/{name}": result.primary})
+
+
+def _record_eval_result(
+    trainer: Trainer, prefix: str, name: str, result: EvalResult
+) -> None:
+    """Record an EvalResult to trainer metrics."""
+    for metric_name, metric_value in result.metrics.items():
+        trainer.record_metric(f"{prefix}/{name}/{metric_name}", metric_value)
+    trainer.record_metric(f"{prefix}/{name}", result.primary)
+
+
+@dataclass
+class DownstreamEvalHook(Callback):
+    """Runs in-loop downstream evaluations periodically during training."""
+
+    evaluators: list[DownstreamEvalRunner] = field(default_factory=list)
+    eval_on_startup: bool = False
+    cancel_after_first_eval: bool = False
+    run_on_test: bool = False
+    n_bootstrap: int = 0
+    bootstrap_seed: int = 42
+
+    def _check_supported_modalities(self, evaluator: DownstreamEvalRunner) -> bool:
+        """Check if the evaluator is supported by the model."""
+        task_supported_modalities = evaluator.config.supported_modalities
+        logger.info(f"Task supported modalities: {task_supported_modalities}")
+        task_instance_used_modalities = evaluator.input_modalities
+        logger.info(f"Task instance used modalities: {task_instance_used_modalities}")
+        if len(task_instance_used_modalities) == 0:
+            task_instance_used_modalities = task_supported_modalities
+
+        if not self.trainer.train_module.model.supports_multiple_modalities_at_once:
+            if len(task_instance_used_modalities) > 1:
+                return False
+
+        does_model_support_all_task_instance_used_modalities = set(
+            task_instance_used_modalities
+        ).issubset(set(self.model_supported_modalities))
+        return does_model_support_all_task_instance_used_modalities
+
+    @property
+    def model_supported_modalities(self) -> list[str]:
+        """Get the supported modalities for the model."""
+        if hasattr(self.trainer.train_module.model, "supported_modalities"):
+            return self.trainer.train_module.model.supported_modalities
+        elif hasattr(self.trainer.train_module.model, "encoder"):
+            if hasattr(
+                self.trainer.train_module.model.encoder, "supported_modality_names"
+            ):
+                return self.trainer.train_module.model.encoder.supported_modality_names
+        else:
+            logger.info(
+                "Can't find a supported_modalities attribute; defaulting to all sensors."
+            )
+        return SensorRegistry.all_labels()
+
+    def _check_input_requirements(self, evaluator: DownstreamEvalRunner) -> bool:
+        """Check if the evaluator is supported by the model."""
+        model = self.trainer.train_module.model
+
+        required_modalities_present = True
+        if hasattr(model, "required_modalities"):
+            required_modalities_present = set(model.required_modalities).issubset(
+                set(evaluator.input_modalities)
+            )
+
+        has_timeseries = True
+        if hasattr(model, "requires_timeseries") and model.requires_timeseries:
+            has_timeseries = evaluator.config.timeseries
+
+        return required_modalities_present and has_timeseries
+
+    def _log_eval_results_to_logger_pretrain(
+        self, evaluator: DownstreamEvalRunner, result: EvalTaskResult
+    ) -> None:
+        """Log the evaluation results."""
+        val_result = result.val_result
+        test_result = result.test_result
+        bootstrap_stats = result.bootstrap_stats
+
+        if bootstrap_stats:
+            logger.info(
+                f"Downstream eval {evaluator.evaluation_name} bootstrap stats: "
+                f"mean={bootstrap_stats.get('mean', 'N/A'):.4f}, "
+                f"std={bootstrap_stats.get('std', 'N/A'):.4f}, "
+                f"95% CI=[{bootstrap_stats.get('ci_lower', 'N/A'):.4f}, "
+                f"{bootstrap_stats.get('ci_upper', 'N/A'):.4f}]"
+            )
+
+        if val_result is not None:
+            logger.info(
+                f"Downstream eval {evaluator.evaluation_name} score: {val_result.primary} (metrics: {val_result.metrics})"
+            )
+        if self.run_on_test and test_result is not None:
+            logger.info(
+                f"Downstream eval {evaluator.evaluation_name} test score: {test_result.primary} (metrics: {test_result.metrics})"
+            )
+
+    def _log_eval_results_to_wandb_pretrain(
+        self, evaluator: DownstreamEvalRunner, result: EvalTaskResult
+    ) -> None:
+        """Log the evaluation results to wandb."""
+        wandb_callback = next(
+            callback
+            for callback in self.trainer._iter_callbacks()
+            if isinstance(callback, SpaceNitExperimentLogger)
+        )
+        val_result = result.val_result
+        test_result = result.test_result
+        eval_time = result.eval_time
+        bootstrap_stats = result.bootstrap_stats
+
+        if wandb_callback.enabled:
+            if val_result is not None:
+                _log_eval_result_to_wandb(
+                    wandb_callback, "eval", evaluator.evaluation_name, val_result
+                )
+            wandb_callback.wandb.log(
+                {"eval_time/" + evaluator.evaluation_name: eval_time}
+            )
+
+        if evaluator.eval_mode == EvalMode.FINETUNE:
+            if wandb_callback.enabled:
+                wandb_callback.wandb.define_metric(
+                    f"{evaluator.evaluation_name}/*",
+                    step_metric=f"{evaluator.evaluation_name}_step",
+                )
+                wandb_callback.wandb.log({f"{evaluator.evaluation_name}_step": 0})
+
+        val_valid = val_result is not None and val_result.primary >= 0
+        test_valid = test_result is not None and test_result.primary >= 0
+
+        if val_valid and test_valid:
+            if bootstrap_stats:
+                wandb_callback.wandb.log(
+                    {
+                        f"eval/test/{evaluator.evaluation_name}_bootstrap_mean": bootstrap_stats.get(
+                            "mean"
+                        ),
+                        f"eval/test/{evaluator.evaluation_name}_bootstrap_std": bootstrap_stats.get(
+                            "std"
+                        ),
+                        f"eval/test/{evaluator.evaluation_name}_bootstrap_ci_lower": bootstrap_stats.get(
+                            "ci_lower"
+                        ),
+                        f"eval/test/{evaluator.evaluation_name}_bootstrap_ci_upper": bootstrap_stats.get(
+                            "ci_upper"
+                        ),
+                    }
+                )
+            if self.run_on_test and test_result is not None:
+                _log_eval_result_to_wandb(
+                    wandb_callback, "eval/test", evaluator.evaluation_name, test_result
+                )
+
+    def pre_train(self) -> None:
+        """Run the evaluators on startup."""
+        if self.eval_on_startup:
+            logger.info(f"Running {len(self.evaluators)} evaluators on startup.")
+
+            for evaluator in self.evaluators:
+                if not self._check_supported_modalities(evaluator):
+                    logger.info(
+                        f"Skipping {evaluator.evaluation_name} because it requires a modality that is not supported by the model"
+                    )
+                    continue
+                if not self._check_input_requirements(evaluator):
+                    logger.info(
+                        f"Skipping {evaluator.evaluation_name} because it doesn't match input requirements of the model"
+                    )
+                    continue
+                result = self._perform_eval(evaluator)
+                self._log_eval_results_to_logger_pretrain(evaluator, result)
+                self._log_eval_results_to_wandb_pretrain(evaluator, result)
+
+        if self.cancel_after_first_eval:
+            self.trainer.cancel_run(
+                "Cancelled from eval hook since 'cancel_after_first_eval' is set",
+                no_sync=True,
+            )
+
+    def post_step(self) -> None:
+        """Run the evaluators in-loop."""
+        for evaluator in self.evaluators:
+            eval_interval_steps = self.trainer.convert_duration_to_steps(
+                evaluator.eval_interval
+            )
+            if self.step <= 1 or self.step % eval_interval_steps != 0:
+                continue
+            if not self._check_supported_modalities(evaluator):
+                logger.info(
+                    f"Skipping {evaluator.evaluation_name} because it requires a modality that is not supported by the model"
+                )
+                continue
+            self._perform_eval(evaluator)
+
+    def _perform_eval(self, evaluator: DownstreamEvalRunner) -> EvalTaskResult:
+        """Run the evaluator."""
+        logger.info(f"Running {evaluator.evaluation_name} evaluations...")
+        start_time = time.monotonic()
+        result = evaluator.val()
+        val_result = result.val_result
+        test_result = result.test_result
+        bootstrap_stats = result.bootstrap_stats
+
+        if val_result is not None:
+            _record_eval_result(
+                self.trainer, "eval", evaluator.evaluation_name, val_result
+            )
+
+        if self.run_on_test and test_result is not None:
+            _record_eval_result(
+                self.trainer, "eval/test", evaluator.evaluation_name, test_result
+            )
+
+        if bootstrap_stats:
+            self.trainer.record_metric(
+                f"eval/test/{evaluator.evaluation_name}_bootstrap_mean",
+                bootstrap_stats.get("mean"),
+            )
+            self.trainer.record_metric(
+                f"eval/test/{evaluator.evaluation_name}_bootstrap_std",
+                bootstrap_stats.get("std"),
+            )
+            self.trainer.record_metric(
+                f"eval/test/{evaluator.evaluation_name}_bootstrap_ci_lower",
+                bootstrap_stats.get("ci_lower"),
+            )
+            self.trainer.record_metric(
+                f"eval/test/{evaluator.evaluation_name}_bootstrap_ci_upper",
+                bootstrap_stats.get("ci_upper"),
+            )
+        eval_time = time.monotonic() - start_time
+        self.trainer.record_metric(f"eval_time/{evaluator.evaluation_name}", eval_time)
+        logger.info(
+            f"Finished {evaluator.evaluation_name} evaluations in {eval_time:.1f} seconds."
+        )
+        result.eval_time = eval_time
+        return result
+
+
+@dataclass
+class DownstreamEvalHookConfig(CallbackConfig):
+    """Config for the downstream evaluation hook."""
+
+    tasks: dict[str, DownstreamTaskConfig]
+    enabled: bool = True
+    eval_on_startup: bool = False
+    cancel_after_first_eval: bool = False
+    tasks_to_run: list[str] | None = None
+    run_on_test: bool = False
+    filter_for_eval_mode: EvalMode | None = None
+    n_bootstrap: int = 0
+    bootstrap_seed: int = 42
+
+    def verify_input_modalities(
+        self, task: DownstreamTaskConfig, config: EvalDatasetConfig
+    ) -> None:
+        """Verify the input modality configuration for a task."""
+        if (task.dataset not in ["pastis", "pastis128", "nandi", "awf"]) and len(
+            task.input_modalities
+        ) > 0:
+            raise ValueError(
+                f"input_modalities is only supported for multimodal tasks, got {task.dataset}"
+            )
+        if len(task.input_modalities) != len(set(task.input_modalities)):
+            raise ValueError(
+                f"input_modalities must contain unique modalities, got {task.input_modalities}"
+            )
+        if not set(task.input_modalities).issubset(set(config.supported_modalities)):
+            raise ValueError(
+                f"input_modalities must be a subset of supported_modalities, got {task.input_modalities} and {config.supported_modalities}"
+            )
+
+    def verify_input_layers(self, task: DownstreamTaskConfig) -> None:
+        """Check input_layers config."""
+        rslearn_datasets = {"nandi", "awf"}
+        layers = task.input_layers or []
+
+        if task.dataset not in rslearn_datasets and layers:
+            raise ValueError(
+                f"`input_layers` not supported for dataset '{task.dataset}'."
+            )
+
+        if len(layers) != len(set(layers)):
+            raise ValueError(f"`input_layers` must be unique, got {layers}")
+
+    def build(self, trainer: Trainer) -> Callback | None:
+        """Build the downstream evaluation hook."""
+        if not self.enabled:
+            return None
+
+        evaluators: list[DownstreamEvalRunner] = []
+        for evaluation_name, task in self.tasks.items():
+            if (
+                self.tasks_to_run is not None
+                and evaluation_name not in self.tasks_to_run
+            ):
+                logger.info(
+                    f"Skipping {evaluation_name} because it is not in the tasks_to_run list"
+                )
+                continue
+            if (
+                self.filter_for_eval_mode is not None
+                and task.eval_mode != self.filter_for_eval_mode
+            ):
+                logger.info(
+                    f"Skipping {evaluation_name} because it is not in the filter_for_eval_mode list"
+                )
+                continue
+
+            config = dataset_to_config(task.dataset)
+            if config.task_type == TaskType.SEGMENTATION:
+                if task.probe_lr is None and task.ft_lr is None:
+                    raise ValueError(
+                        f"probe_lr and ft_lr cannot both be None for {task.dataset}"
+                    )
+
+            self.verify_input_modalities(task, config)
+            task.input_modalities.sort()
+            self.verify_input_layers(task)
+            logger.info(f"Adding {evaluation_name} with eval mode {task.eval_mode}")
+            evaluators.append(
+                DownstreamEvalRunner(
+                    evaluation_name=evaluation_name,
+                    task=task,
+                    trainer=trainer,
+                    device=trainer.device,
+                    run_on_test=self.run_on_test,
+                    n_bootstrap=self.n_bootstrap,
+                    bootstrap_seed=self.bootstrap_seed,
+                )
+            )
+        return DownstreamEvalHook(
+            evaluators=evaluators,
+            eval_on_startup=self.eval_on_startup,
+            cancel_after_first_eval=self.cancel_after_first_eval,
+            run_on_test=self.run_on_test,
+            n_bootstrap=self.n_bootstrap,
+            bootstrap_seed=self.bootstrap_seed,
+        )
