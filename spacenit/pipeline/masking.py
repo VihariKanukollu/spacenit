@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Protocol, Sequence, Union
+from typing import Any, Protocol, Sequence, Union
 
 import torch
 from torch import Tensor
@@ -324,6 +324,9 @@ class CrossSensorMasking:
     For each sensor, applies ``base_strategy`` independently, then ensures
     that between ``min_encoded`` and ``max_encoded`` fraction of total
     tokens are visible.
+
+    Sensors listed in ``decode_only_sensors`` are never visible to the
+    encoder -- all their tokens are prediction targets.
     """
 
     base_strategy: str = "random"
@@ -331,6 +334,7 @@ class CrossSensorMasking:
     base_decode_ratio: float = 0.0
     min_encoded: float = 0.1
     max_encoded: float = 0.9
+    decode_only_sensors: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -654,6 +658,7 @@ def build_masking(config: dict) -> MaskingStrategy:
         "temporal": TemporalMasking,
         "spectral": SpectralMasking,
         "cross_sensor": CrossSensorMasking,
+        "cross_sensor_random": CrossSensorMasking,
         "range": RangeMasking,
         "composite": CompositeMasking,
         "scheduled": ScheduledMasking,
@@ -675,3 +680,37 @@ def build_masking(config: dict) -> MaskingStrategy:
         ]
 
     return cls(**config)
+
+
+# ---------------------------------------------------------------------------
+# Ingestion adapter (DataLoader expects apply_mask())
+# ---------------------------------------------------------------------------
+
+
+class MaskingPolicy(Protocol):
+    """Dataloader-facing masking interface."""
+
+    def apply_mask(self, sample: GeoSample, patch_size: int) -> MaskedGeoSample: ...
+
+
+class _MaskingPolicyFromStrategy:
+    def __init__(self, strategy: MaskingStrategy) -> None:
+        self._strategy = strategy
+        self._step = 0
+
+    def apply_mask(self, sample: GeoSample, patch_size: int) -> MaskedGeoSample:
+        masked = mask_sample(
+            sample,
+            self._strategy,
+            patch_size=patch_size,
+            step=self._step,
+            generator=None,
+        )
+        self._step += 1
+        return masked
+
+
+def build_masking_policy(config: dict[str, Any]) -> MaskingPolicy:
+    """Build a dataloader masking policy from a config dict."""
+    strategy = build_masking(dict(config))
+    return _MaskingPolicyFromStrategy(strategy)

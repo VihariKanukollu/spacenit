@@ -90,8 +90,8 @@ def get_masking_config() -> dict:
     """
     return {
         "type": "cross_sensor_random",
-        "encode_ratio": 0.5,
-        "decode_ratio": 0.5,
+        "base_encode_ratio": 0.5,
+        "base_decode_ratio": 0.5,
         "decode_only_sensors": [
             WORLDCOVER.label,
             SRTM.label,
@@ -145,7 +145,9 @@ def build_dataloader_config(
         max_patch_size=MAX_PATCH_SIZE,
         work_dir=common.save_folder,
         seed=3622,
-        num_masked_views=2,
+        # The current contrastive runner consumes a single MaskedGeoSample.
+        num_masked_views=1,
+        masking_config=get_masking_config(),
         tokenization_config=common.tokenization_config,
     )
 

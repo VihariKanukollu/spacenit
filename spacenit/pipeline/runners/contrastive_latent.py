@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 import torch.distributed.checkpoint.state_dict as dist_cp_sd
+import torch.nn.functional as F
 from olmo_core.distributed.parallel import DataParallelConfig
 from olmo_core.distributed.utils import get_local_rank, get_local_tensor
 from olmo_core.optim import OptimConfig
@@ -74,6 +75,13 @@ class ContrastiveLatentRunner(SpaceNitTrainRunner):
         state_dict_load_opts: dist_cp_sd.StateDictOptions | None = None,
         find_unused_parameters: bool = True,
     ) -> None:
+        # This runner currently uses encoder-pooled representations for InfoNCE
+        # and does not backprop through the decoder. Freeze decoder params so
+        # they are excluded from the optimizer (and don't break checkpoint reload
+        # due to missing optimizer state entries).
+        for p in model.decoder.parameters():
+            p.requires_grad = False
+
         super().__init__(
             model=model,
             optim_config=optim_config,
@@ -119,18 +127,46 @@ class ContrastiveLatentRunner(SpaceNitTrainRunner):
                     k: mb[k] for k in mb.present_keys if mb[k] is not None
                 }
 
-                with self._model_forward_context():
-                    outputs = self.model(sensor_data, patch_size=patch_size)
+                # Provide month indices so month embeddings get gradients (and
+                # optimizer state is present for checkpoint reload).
+                month_indices = None
+                try:
+                    ts = mb.timestamps
+                    if isinstance(ts, torch.Tensor) and ts.ndim >= 3 and ts.shape[-1] >= 2:
+                        month_indices = ts[..., 1].to(dtype=torch.long)  # (B, T)
+                        month_indices = month_indices.clamp(min=0, max=11)
+                except Exception:
+                    month_indices = None
 
-                # Contrastive loss on projected representations
-                loss = self.contrastive_loss(
-                    outputs["online_proj"],
-                    outputs["target_proj"],
-                )
+                with self._model_forward_context():
+                    # Use encoder representations (pooled) for InfoNCE.
+                    online_tokens, _, _ = self.model.encoder(
+                        sensor_data,
+                        patch_size=patch_size,
+                        month_indices=month_indices,
+                    )
+                    online_pooled = online_tokens.mean(dim=1)
+                    online_z = self.model.online_proj(online_pooled)
+
+                    with torch.no_grad():
+                        target_tokens, _, _ = self.model.target_encoder(
+                            sensor_data,
+                            patch_size=patch_size,
+                            month_indices=month_indices,
+                        )
+                        target_pooled = target_tokens.mean(dim=1)
+                        target_z = self.model.target_proj(target_pooled)
+
+                # Stabilize InfoNCE: expect unit-norm vectors.
+                online_z = F.normalize(online_z, dim=-1)
+                with torch.no_grad():
+                    target_z = F.normalize(target_z, dim=-1)
+
+                loss = self.contrastive_loss(online_z, target_z)
 
                 # Uniformity regularizer
                 if self.uniformity_loss is not None:
-                    uni_loss = self.uniformity_loss(outputs["online_proj"])
+                    uni_loss = self.uniformity_loss(online_z)
                     loss = loss + self.uniformity_weight * uni_loss
 
                 loss = loss / num_mb

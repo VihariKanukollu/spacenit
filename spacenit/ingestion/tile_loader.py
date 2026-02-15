@@ -46,12 +46,9 @@ logger = logging.getLogger(__name__)
 # package at import time.
 # ---------------------------------------------------------------------------
 try:
-    from spacenit.pipeline.masking import MaskingConfig, MaskingStrategy
+    from spacenit.pipeline.masking import build_masking_policy
 except ImportError:
-    # Provide a fallback so the module can still be imported for type-checking
-    # or inference-only workflows.
-    MaskingConfig = None  # type: ignore[assignment,misc]
-    MaskingStrategy = None  # type: ignore[assignment,misc]
+    build_masking_policy = None  # type: ignore[assignment,misc]
 
 
 class GeoTileLoader(DataLoaderBase):
@@ -694,8 +691,8 @@ class GeoTileLoaderConfig(Config):
     num_dataset_repeats_per_epoch: int = 1
     # New fields for dataloader-side masking
     transform_config: TransformConfig | None = None
-    masking_config: Any | None = None
-    masking_config_b: Any | None = None
+    masking_config: dict[str, Any] | None = None
+    masking_config_b: dict[str, Any] | None = None
     num_masked_views: int = 1  # 1 = single, 2 = double
     tokenization_config: TokenizationConfig | None = None
 
@@ -735,9 +732,12 @@ class GeoTileLoaderConfig(Config):
         )
         # masking_config is required (validated above)
         assert self.masking_config is not None
-        masking_strategy = self.masking_config.build()
+        assert build_masking_policy is not None, (
+            "spacenit.pipeline.masking is required but could not be imported"
+        )
+        masking_strategy = build_masking_policy(dict(self.masking_config))
         masking_strategy_b = (
-            self.masking_config_b.build()
+            build_masking_policy(dict(self.masking_config_b))
             if self.masking_config_b is not None
             else None
         )

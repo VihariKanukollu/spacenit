@@ -210,7 +210,9 @@ class SpaceNitTrainRunner(TrainModule):
             flatten_optimizer_state_dict=True, cpu_offload=True
         )
         self.state_dict_load_opts = state_dict_load_opts or dist_cp_sd.StateDictOptions(
-            flatten_optimizer_state_dict=True, strict=True
+            # Optimizer state may be missing for params that didn't receive grads yet.
+            flatten_optimizer_state_dict=True,
+            strict=False,
         )
 
     # -- Properties -----------------------------------------------------------
