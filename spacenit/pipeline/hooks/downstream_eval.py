@@ -514,6 +514,11 @@ class DownstreamEvalHook(Callback):
 
     def _check_supported_modalities(self, evaluator: DownstreamEvalRunner) -> bool:
         """Check if the evaluator is supported by the model."""
+        # Unwrap DDP/FSDP wrappers to access model attributes consistently.
+        model = self.trainer.train_module.model
+        if hasattr(model, "module"):
+            model = model.module  # type: ignore[assignment]
+
         task_supported_modalities = evaluator.config.supported_modalities
         logger.info(f"Task supported modalities: {task_supported_modalities}")
         task_instance_used_modalities = evaluator.input_modalities
@@ -521,7 +526,8 @@ class DownstreamEvalHook(Callback):
         if len(task_instance_used_modalities) == 0:
             task_instance_used_modalities = task_supported_modalities
 
-        if not self.trainer.train_module.model.supports_multiple_modalities_at_once:
+        supports_multi = getattr(model, "supports_multiple_modalities_at_once", True)
+        if not supports_multi:
             if len(task_instance_used_modalities) > 1:
                 return False
 
@@ -533,13 +539,15 @@ class DownstreamEvalHook(Callback):
     @property
     def model_supported_modalities(self) -> list[str]:
         """Get the supported modalities for the model."""
-        if hasattr(self.trainer.train_module.model, "supported_modalities"):
-            return self.trainer.train_module.model.supported_modalities
-        elif hasattr(self.trainer.train_module.model, "encoder"):
-            if hasattr(
-                self.trainer.train_module.model.encoder, "supported_modality_names"
-            ):
-                return self.trainer.train_module.model.encoder.supported_modality_names
+        model = self.trainer.train_module.model
+        if hasattr(model, "module"):
+            model = model.module  # type: ignore[assignment]
+
+        if hasattr(model, "supported_modalities"):
+            return model.supported_modalities
+        elif hasattr(model, "encoder"):
+            if hasattr(model.encoder, "supported_modality_names"):
+                return model.encoder.supported_modality_names
         else:
             logger.info(
                 "Can't find a supported_modalities attribute; defaulting to all sensors."
@@ -549,6 +557,8 @@ class DownstreamEvalHook(Callback):
     def _check_input_requirements(self, evaluator: DownstreamEvalRunner) -> bool:
         """Check if the evaluator is supported by the model."""
         model = self.trainer.train_module.model
+        if hasattr(model, "module"):
+            model = model.module  # type: ignore[assignment]
 
         required_modalities_present = True
         if hasattr(model, "required_modalities"):
@@ -690,7 +700,19 @@ class DownstreamEvalHook(Callback):
         """Run the evaluator."""
         logger.info(f"Running {evaluator.evaluation_name} evaluations...")
         start_time = time.monotonic()
-        result = evaluator.val()
+        try:
+            result = evaluator.val()
+        except FileNotFoundError as e:
+            # Downstream datasets are often provided via environment-configured
+            # mounts (e.g. GEOBENCH_DIR). If they're not present, don't crash
+            # a long training run — just skip the eval with a clear warning.
+            logger.warning(
+                "Skipping downstream eval '%s' due to missing dataset files: %s",
+                evaluator.evaluation_name,
+                str(e),
+                exc_info=True,
+            )
+            result = BenchmarkTaskResult(val_result=None, test_result=None)
         val_result = result.val_result
         test_result = result.test_result
         bootstrap_stats = result.bootstrap_stats

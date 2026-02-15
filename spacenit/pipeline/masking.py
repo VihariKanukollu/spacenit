@@ -17,10 +17,13 @@ Core design:
 
 from __future__ import annotations
 
+import logging
 import math
 import random
 from dataclasses import dataclass, field
 from typing import Any, Protocol, Sequence, Union
+
+logger = logging.getLogger(__name__)
 
 import torch
 from torch import Tensor
@@ -554,6 +557,8 @@ def _mark_absent_tokens(
 
     total_channels = getattr(spec, "total_channels", None)
 
+    sensor_label = getattr(spec, "label", "unknown")
+
     if spec.varies_in_space_and_time:
         # Canonical: (C, H, W, T)
         if d.ndim == 5:
@@ -565,13 +570,21 @@ def _mark_absent_tokens(
             if total_channels is None or d.shape[0] != total_channels:
                 d = d.permute(3, 0, 1, 2)  # (H,W,T,C) -> (C,H,W,T)
         else:
-            return  # can't determine layout
+            logger.debug(
+                "_mark_absent_tokens: skipping spatio-temporal sensor %s "
+                "(unexpected ndim=%d)", sensor_label, d.ndim,
+            )
+            return
 
         C, H, W, T = d.shape
         P = patch_size * spec.tile_size_multiplier
         Hp, Wp = H // P, W // P
         # Reshape to (C, Hp, P, Wp, P, T) -> check per-patch-per-timestep
         if H % P != 0 or W % P != 0:
+            logger.debug(
+                "_mark_absent_tokens: skipping sensor %s "
+                "(H=%d or W=%d not divisible by P=%d)", sensor_label, H, W, P,
+            )
             return
         d = d.reshape(C, Hp, P, Wp, P, T)
         # All channels absent in a patch-timestep? -> (Hp, Wp, T) bool
@@ -580,8 +593,17 @@ def _mark_absent_tokens(
         absent_flat = absent_map.reshape(-1).repeat(spec.group_count)
         if absent_flat.shape[0] == mask.shape[0]:
             mask[absent_flat] = absent_value
+        else:
+            logger.debug(
+                "_mark_absent_tokens: shape mismatch for sensor %s "
+                "(absent_flat=%d vs mask=%d)", sensor_label,
+                absent_flat.shape[0], mask.shape[0],
+            )
 
     elif spec.varies_in_space_only:
+        # Squeeze singleton time dim if present: (H, W, 1, C) -> (H, W, C)
+        if d.ndim == 4 and d.shape[2] == 1:
+            d = d.squeeze(2)
         if d.ndim == 5:
             d = d[0]  # drop batch
         if d.ndim == 4:
@@ -590,23 +612,44 @@ def _mark_absent_tokens(
             elif total_channels is not None and d.shape[0] == total_channels:
                 pass  # already (C, H, W)
             else:
-                d = d.permute(2, 0, 1) if d.ndim == 3 else d[0].permute(2, 0, 1)
+                d = d[0].permute(2, 0, 1)  # (B,H,W,C) -> (C,H,W)
         elif d.ndim == 3:
             if total_channels is None or d.shape[0] != total_channels:
                 d = d.permute(2, 0, 1)  # (H,W,C) -> (C,H,W)
         else:
+            logger.debug(
+                "_mark_absent_tokens: skipping spatial-only sensor %s "
+                "(unexpected ndim=%d)", sensor_label, d.ndim,
+            )
+            return
+
+        if d.ndim != 3:
+            logger.debug(
+                "_mark_absent_tokens: skipping spatial-only sensor %s "
+                "(could not reduce to 3D, got ndim=%d)", sensor_label, d.ndim,
+            )
             return
 
         C, H, W = d.shape
         P = patch_size * spec.tile_size_multiplier
         Hp, Wp = H // P, W // P
         if H % P != 0 or W % P != 0:
+            logger.debug(
+                "_mark_absent_tokens: skipping sensor %s "
+                "(H=%d or W=%d not divisible by P=%d)", sensor_label, H, W, P,
+            )
             return
         d = d.reshape(C, Hp, P, Wp, P)
         absent_map = (d == absent_indicator).all(dim=(0, 2, 4))  # (Hp, Wp)
         absent_flat = absent_map.reshape(-1).repeat(spec.group_count)
         if absent_flat.shape[0] == mask.shape[0]:
             mask[absent_flat] = absent_value
+        else:
+            logger.debug(
+                "_mark_absent_tokens: shape mismatch for sensor %s "
+                "(absent_flat=%d vs mask=%d)", sensor_label,
+                absent_flat.shape[0], mask.shape[0],
+            )
 
     elif spec.varies_in_time_only:
         if d.ndim >= 3:
@@ -620,6 +663,12 @@ def _mark_absent_tokens(
             absent_flat = absent_per_t.repeat(spec.group_count)
             if absent_flat.shape[0] == mask.shape[0]:
                 mask[absent_flat] = absent_value
+            else:
+                logger.debug(
+                    "_mark_absent_tokens: shape mismatch for sensor %s "
+                    "(absent_flat=%d vs mask=%d)", sensor_label,
+                    absent_flat.shape[0], mask.shape[0],
+                )
 
     # Scalar sensors: if all values are absent, mark the single token
     elif spec.group_count == 1 and mask.shape[0] == 1:

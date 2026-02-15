@@ -262,14 +262,21 @@ class UniformityLoss(nn.Module):
         Returns:
             Scalar uniformity loss (lower = more uniform).
         """
+        B = embeddings.shape[0]
+        # With B<2 the off-diagonal set is empty; define 0 regularizer.
+        if B < 2:
+            return embeddings.new_zeros([])
+
+        # torch.cdist on CUDA does not support bfloat16; compute in fp32.
+        emb = embeddings.float()
+
         # Pairwise squared distances: (B, B)
-        sq_dists = torch.cdist(embeddings, embeddings, p=2).pow(2)
+        sq_dists = torch.cdist(emb, emb, p=2).pow(2)
 
         # Gaussian potential
         potentials = torch.exp(-self.t * sq_dists)
 
         # Exclude self-pairs (diagonal)
-        B = embeddings.shape[0]
         mask = ~torch.eye(B, dtype=torch.bool, device=embeddings.device)
         potentials = potentials[mask]
 
