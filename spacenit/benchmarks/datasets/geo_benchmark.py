@@ -275,7 +275,13 @@ class GeoBenchmarkDataset(Dataset):
                     axis=-1,
                 )[:, :, :, BENCH_TO_SPACENIT_L8_BANDS]
 
-            sample_dict["landsat"] = torch.tensor(landsat).float()
+            # SpaceNit expects channel-first tensors; the benchmark adapters and
+            # encoder tokenizer operate on (B, C, H, W) or (B, C, H, W, T).
+            # Here we have (H, W, T, C), so convert to (C, H, W, T) and let the
+            # collate_fn add the batch dimension.
+            sample_dict["landsat"] = (
+                torch.tensor(landsat).permute(3, 0, 1, 2).contiguous().float()
+            )
 
         else:
             s2 = repeat(x, "h w c -> h w t c", t=1)[
@@ -287,7 +293,9 @@ class GeoBenchmarkDataset(Dataset):
             # Normalize using the pretrained dataset's normalization stats
             if self.norm_stats_from_pretrained:
                 s2 = self.normalizer_computed.normalize(SENTINEL2_L2A, s2)
-            sample_dict["sentinel2_l2a"] = torch.tensor(s2).float()
+            sample_dict["sentinel2_l2a"] = (
+                torch.tensor(s2).permute(3, 0, 1, 2).contiguous().float()
+            )
 
         timestamp = repeat(torch.tensor(self.default_day_month_year), "d -> t d", t=1)
         masked_sample = MaskedGeoSample.from_geosample(

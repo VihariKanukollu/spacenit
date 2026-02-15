@@ -262,20 +262,77 @@ class DownstreamEvalRunner:
         print(
             f"Getting embeddings for {self.dataset} with norm method {self.norm_method}"
         )
-        if hasattr(self.trainer.train_module.model, "encoder"):
-            model = self.trainer.train_module.model.encoder
+        # Representation source for evaluation:
+        # - If we have a full SSL model with an EMA target branch (e.g. LatentPredictor),
+        #   pass the full model to the benchmark adapter so it can choose the most
+        #   appropriate representation (often the target/projection features).
+        # - Otherwise, fall back to using an `encoder` submodule when present.
+        train_model = self.trainer.train_module.model
+        rep = os.getenv("SPACENIT_EVAL_REPRESENTATION", "").strip().lower()
+        # Default to evaluating the encoder/backbone features (closer to common
+        # SSL/GeoBench protocols). You can override via SPACENIT_EVAL_REPRESENTATION:
+        # - "proj": use LatentPredictor projections (target_proj/online_proj)
+        # - "target_encoder"/"ema": use the momentum encoder tokens
+        # - "encoder"/"backbone": use the online encoder tokens
+        if rep in {"proj", "projection"} and hasattr(train_model, "target_encoder") and hasattr(
+            train_model, "target_proj"
+        ):
+            model = train_model
+        elif rep in {"target_encoder", "ema"} and hasattr(train_model, "target_encoder"):
+            model = train_model.target_encoder
+        elif hasattr(train_model, "encoder"):
+            model = train_model.encoder
+        elif hasattr(train_model, "target_encoder"):
+            model = train_model.target_encoder
         else:
-            model = self.trainer.train_module.model
+            model = train_model
 
-        if hasattr(model, "patch_size"):
-            self.patch_size = model.patch_size
-            logger.info(
-                f"Using patch size {self.patch_size} for {self.dataset} with model patch size {model.patch_size} and task patch size {self.patch_size}"
-            )
-        else:
-            logger.info(
-                f"No patch size found from model for {self.dataset}, using task patch size {self.patch_size}"
-            )
+        # Unwrap DDP wrapper for adapter type checks. Do NOT unwrap FSDP, since
+        # FSDP's wrapper is responsible for unsharding parameters on forward.
+        try:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+
+            if isinstance(model, DDP):
+                model = model.module  # type: ignore[assignment]
+        except Exception:
+            pass
+
+        # GeoBench evaluation commonly uses smaller patch sizes (e.g. 4 for
+        # 64x64 m-eurosat tiles). However, under FSDP2 composable sharding, the
+        # patch-embed resize path can run into DTensor / op compatibility issues.
+        # Heuristic:
+        # - Prefer the *task* patch size in normal (DDP / single-GPU) eval.
+        # - If model params are DTensors (FSDP2), fall back to the model's native
+        #   patch size when it differs, to avoid DTensor interpolation issues.
+        task_patch_size = self.patch_size
+        model_patch_size = getattr(model, "patch_size", None)
+        # Some composite models (e.g. LatentPredictor) don't expose patch_size
+        # directly but their encoder does.
+        if model_patch_size is None and hasattr(model, "encoder") and hasattr(
+            model.encoder, "patch_size"
+        ):
+            model_patch_size = model.encoder.patch_size
+        use_patch_size = task_patch_size
+        dtensor_params = False
+
+        try:
+            from torch.distributed.tensor import DTensor  # type: ignore
+
+            p0 = next(model.parameters(), None)
+            dtensor_params = p0 is not None and isinstance(p0.data, DTensor)
+        except Exception:
+            dtensor_params = False
+
+        if dtensor_params and model_patch_size is not None and task_patch_size != model_patch_size:
+            use_patch_size = model_patch_size
+
+        logger.info(
+            f"Using patch size {use_patch_size} for {self.dataset} "
+            f"(task_patch_size={task_patch_size}, model_patch_size={model_patch_size}, "
+            f"dtensor_params={dtensor_params})"
+        )
+
+        self.patch_size = use_patch_size
 
         wrapper_kwargs = {
             "task_type": self.config.task_type,
@@ -356,17 +413,185 @@ class DownstreamEvalRunner:
 
         kwargs = {
             "config": self.config,
-            "train_embeddings": train_embeddings,
+            "train_features": train_embeddings,
             "train_labels": train_labels,
-            "val_embeddings": val_embeddings,
+            "val_features": val_embeddings,
             "val_labels": val_labels,
-            "test_embeddings": test_embeddings,
+            "test_features": test_embeddings,
             "test_labels": test_labels,
             "device": self.device,
             "n_bootstrap": self.n_bootstrap,
             "bootstrap_seed": self.bootstrap_seed,
         }
         result = self.eval_function(**kwargs)  # type: ignore
+
+        # Optional extra diagnostics to match common GeoBench reporting:
+        # - KNN sweep over (k, tau) to find best validation score
+        # - Logistic regression (LBFGS) with standardization
+        #
+        # Enabled via env var so training runs aren't slowed down.
+        if (
+            os.getenv("SPACENIT_EVAL_DIAGNOSTICS", "").lower()
+            in {"1", "true", "yes"}
+            and self.eval_mode == EvalMode.KNN
+            and self.config.task_type == TaskType.CLASSIFICATION
+            and not self.config.is_multilabel
+        ):
+            run_extra = True
+            try:
+                import torch.distributed as dist
+
+                if dist.is_initialized() and dist.get_rank() != 0:
+                    run_extra = False
+            except Exception:
+                run_extra = True
+
+            if run_extra and self.device is not None:
+                try:
+                    import torch.nn.functional as F
+
+                    def _best_weighted_knn(
+                        *,
+                        train_x: torch.Tensor,
+                        train_y: torch.Tensor,
+                        query_x: torch.Tensor,
+                        query_y: torch.Tensor,
+                        num_classes: int,
+                        device: torch.device,
+                        k_values: list[int],
+                        tau_values: list[float],
+                    ) -> tuple[float, int, float]:
+                        """Return (best_acc, best_k, best_tau) on query set."""
+                        max_k = max(k_values)
+
+                        train_x = train_x.to(device=device, dtype=torch.float32)
+                        query_x = query_x.to(device=device, dtype=torch.float32)
+                        train_y = train_y.to(device=device)
+                        query_y = query_y.to(device=device)
+
+                        train_x = F.normalize(train_x, p=2, dim=1, eps=1e-8)
+                        query_x = F.normalize(query_x, p=2, dim=1, eps=1e-8)
+
+                        sims = torch.mm(query_x, train_x.T)  # (Nq, Nt)
+                        top_sim, top_idx = torch.topk(sims, k=max_k, dim=1)
+                        top_labels = train_y[top_idx]  # (Nq, max_k)
+                        top_onehot = F.one_hot(top_labels, num_classes=num_classes).to(
+                            dtype=torch.float32
+                        )
+
+                        best_acc = -1.0
+                        best_k = k_values[0]
+                        best_tau = tau_values[0]
+
+                        for tau in tau_values:
+                            weights_all = torch.exp(top_sim / float(tau))
+                            for k in k_values:
+                                weights = weights_all[:, :k]
+                                onehot = top_onehot[:, :k]
+                                weighted_sum = (weights.unsqueeze(-1) * onehot).sum(dim=1)
+                                preds = torch.argmax(weighted_sum, dim=1)
+                                acc = (preds == query_y).float().mean().item()
+                                if acc > best_acc:
+                                    best_acc, best_k, best_tau = acc, int(k), float(tau)
+
+                        return float(best_acc), int(best_k), float(best_tau)
+
+                    # Match common sweeps used in other repos.
+                    k_values = [1, 3, 5, 10, 20, 50, 100, 200]
+                    tau_values = [0.02, 0.05, 0.07, 0.1, 0.2]
+
+                    val_best_acc, val_best_k, val_best_tau = _best_weighted_knn(
+                        train_x=train_embeddings,
+                        train_y=train_labels,
+                        query_x=val_embeddings,
+                        query_y=val_labels,
+                        num_classes=self.config.num_classes,
+                        device=self.device,
+                        k_values=k_values,
+                        tau_values=tau_values,
+                    )
+
+                    test_best_acc = None
+                    if test_embeddings is not None and test_labels is not None:
+                        # Evaluate the chosen (k, tau) on test.
+                        max_k = val_best_k
+                        train_x = train_embeddings.to(self.device, dtype=torch.float32)
+                        test_x = test_embeddings.to(self.device, dtype=torch.float32)
+                        train_y = train_labels.to(self.device)
+                        test_y = test_labels.to(self.device)
+                        train_x = F.normalize(train_x, p=2, dim=1, eps=1e-8)
+                        test_x = F.normalize(test_x, p=2, dim=1, eps=1e-8)
+                        sims = torch.mm(test_x, train_x.T)
+                        top_sim, top_idx = torch.topk(sims, k=max_k, dim=1)
+                        top_labels = train_y[top_idx]
+                        top_onehot = F.one_hot(
+                            top_labels, num_classes=self.config.num_classes
+                        ).to(dtype=torch.float32)
+                        weights = torch.exp(top_sim / float(val_best_tau))
+                        weighted_sum = (weights.unsqueeze(-1) * top_onehot).sum(dim=1)
+                        preds = torch.argmax(weighted_sum, dim=1)
+                        test_best_acc = (preds == test_y).float().mean().item()
+
+                    # Attach to metrics (doesn't change primary score).
+                    if result.val_result is not None:
+                        result.val_result.metrics["knn_best_accuracy"] = float(val_best_acc)
+                        result.val_result.metrics["knn_best_k"] = float(val_best_k)
+                        result.val_result.metrics["knn_best_tau"] = float(val_best_tau)
+                    if result.test_result is not None and test_best_acc is not None:
+                        result.test_result.metrics["knn_best_accuracy"] = float(test_best_acc)
+                        result.test_result.metrics["knn_best_k"] = float(val_best_k)
+                        result.test_result.metrics["knn_best_tau"] = float(val_best_tau)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("KNN diagnostics failed: %s", str(e))
+
+                # Logistic regression (LBFGS) diagnostic.
+                try:
+                    from sklearn.linear_model import LogisticRegression
+                    from sklearn.preprocessing import StandardScaler
+
+                    X_train = train_embeddings.detach().cpu().float().numpy()
+                    y_train = train_labels.detach().cpu().numpy()
+                    X_val = val_embeddings.detach().cpu().float().numpy()
+                    y_val = val_labels.detach().cpu().numpy()
+                    X_test = (
+                        test_embeddings.detach().cpu().float().numpy()
+                        if test_embeddings is not None
+                        else None
+                    )
+                    y_test = test_labels.detach().cpu().numpy() if test_labels is not None else None
+
+                    scaler = StandardScaler()
+                    X_train_s = scaler.fit_transform(X_train)
+                    X_val_s = scaler.transform(X_val)
+                    X_test_s = scaler.transform(X_test) if X_test is not None else None
+
+                    best_val = -1.0
+                    best_test = None
+                    best_l2 = None
+                    for l2_reg in (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0):
+                        C = 1.0 / float(l2_reg)
+                        clf = LogisticRegression(
+                            penalty="l2",
+                            C=C,
+                            solver="lbfgs",
+                            max_iter=300,
+                        )
+                        clf.fit(X_train_s, y_train)
+                        val_acc = float(clf.score(X_val_s, y_val))
+                        if val_acc > best_val:
+                            best_val = val_acc
+                            best_l2 = float(l2_reg)
+                            if X_test_s is not None and y_test is not None:
+                                best_test = float(clf.score(X_test_s, y_test))
+
+                    if result.val_result is not None and best_l2 is not None:
+                        result.val_result.metrics["logreg_best_accuracy"] = float(best_val)
+                        result.val_result.metrics["logreg_best_l2_reg"] = float(best_l2)
+                    if result.test_result is not None and best_test is not None and best_l2 is not None:
+                        result.test_result.metrics["logreg_best_accuracy"] = float(best_test)
+                        result.test_result.metrics["logreg_best_l2_reg"] = float(best_l2)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("LogReg diagnostics failed: %s", str(e))
 
         # Free memory aggressively between evals
         del train_embeddings, train_labels, val_embeddings, val_labels
@@ -607,27 +832,25 @@ class DownstreamEvalHook(Callback):
             for callback in self.trainer._iter_callbacks()
             if isinstance(callback, SpaceNitExperimentLogger)
         )
+        if not wandb_callback.enabled:
+            return
         val_result = result.val_result
         test_result = result.test_result
         eval_time = result.eval_time
         bootstrap_stats = result.bootstrap_stats
 
-        if wandb_callback.enabled:
-            if val_result is not None:
-                _log_eval_result_to_wandb(
-                    wandb_callback, "eval", evaluator.evaluation_name, val_result
-                )
-            wandb_callback.wandb.log(
-                {"eval_time/" + evaluator.evaluation_name: eval_time}
+        if val_result is not None:
+            _log_eval_result_to_wandb(
+                wandb_callback, "eval", evaluator.evaluation_name, val_result
             )
+        wandb_callback.wandb.log({"eval_time/" + evaluator.evaluation_name: eval_time})
 
         if evaluator.eval_mode == EvalMode.FINETUNE:
-            if wandb_callback.enabled:
-                wandb_callback.wandb.define_metric(
-                    f"{evaluator.evaluation_name}/*",
-                    step_metric=f"{evaluator.evaluation_name}_step",
-                )
-                wandb_callback.wandb.log({f"{evaluator.evaluation_name}_step": 0})
+            wandb_callback.wandb.define_metric(
+                f"{evaluator.evaluation_name}/*",
+                step_metric=f"{evaluator.evaluation_name}_step",
+            )
+            wandb_callback.wandb.log({f"{evaluator.evaluation_name}_step": 0})
 
         val_valid = val_result is not None and val_result.primary >= 0
         test_valid = test_result is not None and test_result.primary >= 0

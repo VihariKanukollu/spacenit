@@ -329,6 +329,9 @@ class Encoder(nn.Module):
     def __init__(self, config: EncoderConfig) -> None:
         super().__init__()
         self.config = config
+        # Exposed for downstream evaluation: if present, eval uses the model's
+        # patch size instead of task defaults (avoids DTensor/FSDP resizing ops).
+        self.patch_size = int(config.base_patch_size)
 
         self.tokenizer = MultiSensorTokenizer(config)
 

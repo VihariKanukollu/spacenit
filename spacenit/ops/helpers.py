@@ -196,15 +196,31 @@ MODEL_SIZE_ARGS = {
 class MockGeoTileLoader(DataLoaderBase):
     """Minimal dataloader that only satisfies the abstract interface."""
 
-    def __init__(self) -> None:
-        """Initialize the mock loader with trivial single-rank defaults."""
+    def __init__(
+        self,
+        *,
+        work_dir: str = "./",
+        global_batch_size: int = 128,
+        token_budget: int = 2250,
+        dp_world_size: int = 1,
+        dp_rank: int = 0,
+        fs_local_rank: int = 0,
+    ) -> None:
+        """Initialize the mock loader.
+
+        Note: evaluation jobs may run under DDP/FSDP to be able to load sharded
+        distributed checkpoints. In that case, the trainer expects the loader's
+        data-parallel world size / rank to match the model's data-parallel mesh.
+        """
         super().__init__(
-            work_dir="./",
-            global_batch_size=128,
-            dp_world_size=1,
-            dp_rank=0,
-            fs_local_rank=0,
+            work_dir=work_dir,
+            global_batch_size=global_batch_size,
+            dp_world_size=dp_world_size,
+            dp_rank=dp_rank,
+            fs_local_rank=fs_local_rank,
         )
+        # Some callbacks expect these attributes to exist on the dataloader.
+        self.token_budget = int(token_budget)
         self._seed = 42
         self._epoch = 0
 

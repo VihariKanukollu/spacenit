@@ -1,12 +1,15 @@
 """Code for configuring and running SpaceNit experiments."""
 
+import json
 import logging
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import cast
 
 import numpy as np
+import torch.distributed as dist
 from olmo_core.config import StrEnum
 from olmo_core.distributed.utils import get_local_rank
 from olmo_core.launch.beaker import BeakerLaunchConfig, ExperimentSpec
@@ -286,16 +289,66 @@ def evaluate(config: SpaceNitEvaluateConfig) -> None:
     model = config.model.build()
     device = get_default_device()
     model = model.to(device)
-    data_loader = MockGeoTileLoader()
 
     if config.trainer.load_path is not None:
         if config.train_module is None:
             raise ValueError("train_module is not set so we can't load the checkpoint")
         train_module = config.train_module.build(model)
-        data_loader.min_patch_size = model.encoder.min_patch_size
-        data_loader.max_patch_size = model.encoder.max_patch_size
+        # The downstream evaluator uses its own dataset loaders; this mock loader
+        # is only here to satisfy the trainer interface. Some components expect
+        # these attributes to exist, so infer them from the checkpoint config
+        # when possible, otherwise fall back to safe defaults.
+        min_patch_size: int | None = None
+        max_patch_size: int | None = None
+        global_batch_size: int | None = None
+        token_budget: int | None = None
+
+        try:
+            ckpt_dir = Path(config.trainer.load_path)
+            cfg_path = ckpt_dir / "config.json"
+            if cfg_path.exists():
+                with cfg_path.open() as f:
+                    cfg_dict = json.load(f)
+                dl_cfg = cfg_dict.get("data_loader") or {}
+                min_patch_size = dl_cfg.get("min_patch_size", None)
+                max_patch_size = dl_cfg.get("max_patch_size", None)
+                global_batch_size = dl_cfg.get("global_batch_size", None)
+                token_budget = dl_cfg.get("token_budget", None)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Failed to infer patch size range from checkpoint config at '%s': %s",
+                str(config.trainer.load_path),
+                str(e),
+            )
+
+        # Build the mock loader with correct DP metadata so the trainer can
+        # validate it against the model's data-parallel mesh.
+        dp_world_size = dist.get_world_size() if dist.is_initialized() else 1
+        dp_rank = dist.get_rank() if dist.is_initialized() else 0
+        if global_batch_size is None:
+            rank_microbatch_size = int(getattr(train_module, "rank_microbatch_size", 1))
+            global_batch_size = max(rank_microbatch_size * dp_world_size, 1)
+        if token_budget is None:
+            token_budget = 2250
+        data_loader = MockGeoTileLoader(
+            global_batch_size=int(global_batch_size),
+            token_budget=int(token_budget),
+            dp_world_size=dp_world_size,
+            dp_rank=dp_rank,
+            fs_local_rank=get_local_rank(),
+        )
+
+        if min_patch_size is None:
+            min_patch_size = 1
+        if max_patch_size is None:
+            # Nano default, but this value is only used for interface compatibility.
+            max_patch_size = 8
+
+        data_loader.min_patch_size = int(min_patch_size)
+        data_loader.max_patch_size = int(max_patch_size)
     else:
         train_module = MockLatentMIMTrainModule()
+        data_loader = MockGeoTileLoader()
 
     train_module.model = model
     trainer = config.trainer.build(train_module, data_loader)

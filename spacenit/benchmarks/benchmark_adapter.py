@@ -126,21 +126,48 @@ class SpaceNitBenchmarkAdapter(BenchmarkAdapter):
         labels: torch.Tensor,
         is_train: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through the encoder, then pool tokens."""
+        """Forward pass through the model, then return pooled features.
+
+        For :class:`~spacenit.arch.models.LatentPredictor` (SSL w/ EMA target),
+        we prefer the *contrastive projection* features for classification KNN /
+        probing, since that's the representation directly optimized by the
+        contrastive objective. For segmentation tasks, we still return tokens.
+        """
         sensor_data = _extract_sensor_data(sample)
 
-        # Get the encoder -- it may be the model itself or a sub-module
+        # ------------------------------------------------------------
+        # LatentPredictor: use contrastive projection for classification
+        # ------------------------------------------------------------
+        if isinstance(self.model, LatentPredictor) and not self.spatial_pool:
+            month_indices = None
+            try:
+                ts = getattr(sample, "timestamps", None)
+                if isinstance(ts, torch.Tensor) and ts.ndim >= 3 and ts.shape[-1] >= 2:
+                    month_indices = ts[..., 1].to(dtype=torch.long)
+                    month_indices = month_indices.clamp(min=0, max=11)
+            except Exception:
+                month_indices = None
+
+            outputs = self.model(
+                sensor_data,
+                patch_size=self.patch_size,
+                month_indices=month_indices,
+                contrastive_only=True,
+            )
+            # Use the EMA/target branch by default; it's typically more stable.
+            features = outputs.get("target_proj", outputs["online_proj"])
+            return features, labels
+
+        # ------------------------------------------------------------
+        # Encoder-style: pool token embeddings
+        # ------------------------------------------------------------
         encoder = self.model
         if hasattr(self.model, "encoder"):
             encoder = self.model.encoder
 
-        encoded, sensor_ids, layout = encoder(
-            sensor_data, patch_size=self.patch_size
-        )
+        encoded, sensor_ids, layout = encoder(sensor_data, patch_size=self.patch_size)
 
-        batch_features = _pool_tokens(
-            encoded, self.pooling_type, spatial_pool=self.spatial_pool
-        )
+        batch_features = _pool_tokens(encoded, self.pooling_type, spatial_pool=self.spatial_pool)
         return batch_features, labels
 
 

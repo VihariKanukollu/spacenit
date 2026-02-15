@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.distributed.tensor import DTensor, Replicate
 
 from spacenit.arch.attention import _build_rope_freqs
 
@@ -100,6 +101,19 @@ class AdaptivePatchEmbed(nn.Module):
         # Project with (possibly resized) weight
         weight = self._get_weight_for_patch_size(P)
         bias = self.proj.bias
+        # If the model is wrapped with DTensor-based parallelism (e.g. FSDP),
+        # parameters may be DTensors while inputs are regular tensors in some
+        # evaluation paths. Convert inputs/bias to DTensors to avoid mixed
+        # Tensor/DTensor operator errors.
+        if isinstance(weight, DTensor):
+            if not isinstance(patches, DTensor):
+                patches = DTensor.from_local(
+                    patches, device_mesh=weight.device_mesh, placements=(Replicate(),)
+                )
+            if bias is not None and not isinstance(bias, DTensor):
+                bias = DTensor.from_local(
+                    bias, device_mesh=weight.device_mesh, placements=weight.placements
+                )
         tokens = F.linear(patches, weight, bias)
 
         return tokens
@@ -263,6 +277,10 @@ class CyclicMonthEmbed(nn.Module):
         # Under FSDP mixed precision the projection weights may be bfloat16.
         # Ensure dtype matches to avoid matmul dtype mismatches.
         raw = raw.to(dtype=self.proj.weight.dtype)
+        if isinstance(self.proj.weight, DTensor) and not isinstance(raw, DTensor):
+            raw = DTensor.from_local(
+                raw, device_mesh=self.proj.weight.device_mesh, placements=(Replicate(),)
+            )
         return self.proj(raw)
 
 
@@ -297,4 +315,22 @@ class SensorEmbed(nn.Module):
         Returns:
             Embeddings of shape ``(*sensor_ids.shape, embed_dim)``.
         """
+        weight = self.embedding.weight
+        if isinstance(weight, DTensor):
+            # `fully_shard()` can shard embedding weights as DTensors, but the
+            # DTensor embedding op expects compatible layouts and can error
+            # (or even trigger device-side asserts) when given replicated global
+            # indices. These embeddings are tiny (num_sensors ~ O(10)), so we
+            # safely replicate weights for evaluation/training stability.
+            weight = weight.redistribute(placements=(Replicate(),))
+            if not isinstance(sensor_ids, DTensor):
+                sensor_ids = DTensor.from_local(
+                    sensor_ids,
+                    device_mesh=weight.device_mesh,
+                    placements=(Replicate(),),
+                )
+            elif sensor_ids.placements != (Replicate(),):
+                sensor_ids = sensor_ids.redistribute(placements=(Replicate(),))
+            return F.embedding(sensor_ids.long(), weight)
+
         return self.embedding(sensor_ids)

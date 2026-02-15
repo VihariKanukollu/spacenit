@@ -132,3 +132,10 @@ class Standardizer:
             return self._standardize_computed(sensor, data)
         else:
             raise ValueError(f"Invalid strategy: {self.strategy}")
+
+    def normalize(self, sensor: SensorSpec, data: np.ndarray) -> np.ndarray:
+        """Backward-compatible alias for :meth:`standardize`.
+
+        Several benchmark dataset adapters historically used ``normalize()``.
+        """
+        return self.standardize(sensor, data)

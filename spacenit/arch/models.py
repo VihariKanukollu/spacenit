@@ -23,6 +23,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.distributed.tensor import DTensor
 
 from spacenit.arch.attention import RMSNorm, TransformerBlock, TransformerStack
 from spacenit.arch.encoder import Decoder, Encoder, EncoderConfig
@@ -46,8 +47,38 @@ def _ema_update(
 
     ``target_param = momentum * target_param + (1 - momentum) * online_param``
     """
-    for p_online, p_target in zip(online.parameters(), target.parameters()):
-        p_target.data.mul_(momentum).add_(p_online.data, alpha=1.0 - momentum)
+    # Under FSDP2 composable sharding, params may be DTensors. EMA must update
+    # the target params using the *same* DTensor layout as the online params.
+    target_by_name = dict(target.named_parameters())
+    for name, p_online in online.named_parameters():
+        p_target = target_by_name.get(name)
+        if p_target is None:
+            continue
+
+        online_data = p_online.data
+        target_data = p_target.data
+
+        if isinstance(online_data, DTensor) or isinstance(target_data, DTensor):
+            if not isinstance(online_data, DTensor) or not isinstance(target_data, DTensor):
+                raise RuntimeError(
+                    f"EMA expected both online and target params to be DTensors for '{name}', "
+                    f"got online={type(online_data)} target={type(target_data)}"
+                )
+
+            # Align target layout to online layout (this fixes Shard vs Replicate mismatches).
+            if target_data.device_mesh != online_data.device_mesh:
+                target_data = target_data.redistribute(
+                    device_mesh=online_data.device_mesh, placements=online_data.placements
+                )
+            elif target_data.placements != online_data.placements:
+                target_data = target_data.redistribute(placements=online_data.placements)
+
+            p_target.data = target_data
+            target_data.mul_(momentum).add_(online_data, alpha=1.0 - momentum)
+            continue
+
+        # Non-DTensor path.
+        target_data.mul_(momentum).add_(online_data, alpha=1.0 - momentum)
 
 
 # ---------------------------------------------------------------------------
@@ -167,10 +198,31 @@ class LatentPredictor(ParallelMixin, nn.Module):
         reduce_dtype: torch.dtype = torch.float32,
     ) -> None:
         # FSDP2 composable API.
+        #
+        # Important: downstream eval sometimes calls `model.encoder(...)` directly.
+        # If we only shard the top-level module, calling a submodule directly can
+        # bypass FSDP unshard/reshard hooks and surface DTensor parameters inside
+        # ops (mixed Tensor/DTensor errors). Shard the relevant submodules so
+        # they remain FSDP-wrapped even when called directly.
         from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 
         mp = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
-        fully_shard(self, mesh=dp_mesh, mp_policy=mp)
+        # Ensure the momentum (target) modules get sharded the same way as the
+        # online modules. Some FSDP2 paths may treat `requires_grad=False` params
+        # differently (replicated), which breaks EMA updates.
+        for p in self.target_encoder.parameters():
+            p.requires_grad = True
+        for p in self.target_proj.parameters():
+            p.requires_grad = True
+        fully_shard(self.encoder, mesh=dp_mesh, mp_policy=mp)
+        fully_shard(self.target_encoder, mesh=dp_mesh, mp_policy=mp)
+        fully_shard(self.decoder, mesh=dp_mesh, mp_policy=mp)
+        fully_shard(self.online_proj, mesh=dp_mesh, mp_policy=mp)
+        fully_shard(self.target_proj, mesh=dp_mesh, mp_policy=mp)
+        for p in self.target_encoder.parameters():
+            p.requires_grad = False
+        for p in self.target_proj.parameters():
+            p.requires_grad = False
 
     def apply_compile(self) -> None:
         # Optional; used only when runner requests compile.

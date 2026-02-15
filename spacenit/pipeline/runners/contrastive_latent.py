@@ -113,6 +113,13 @@ class ContrastiveLatentRunner(SpaceNitTrainRunner):
         batch: tuple[int, MaskedGeoSample],
         dry_run: bool = False,
     ) -> None:
+        # Evaluation jobs use a mock dataloader and may provide no batches.
+        # The core Trainer runs a dry-run batch unconditionally; make that a no-op.
+        if batch is None:
+            if dry_run:
+                return
+            raise TypeError("train_batch received None batch")
+
         self.model.train()
         total_loss = torch.zeros([], device=self.device)
         patch_size, batch_data = batch
