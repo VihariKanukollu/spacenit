@@ -7,7 +7,9 @@ import torch
 from einops import rearrange, reduce
 from torch import nn
 
-from spacenit.benchmarks.datasets.registry import TaskType
+from spacenit.arch.common import PoolingType
+from spacenit.arch.encoder import Encoder
+from spacenit.arch.models import LatentPredictor, SpatioTemporalEncoder
 from spacenit.benchmarks.adapters import (
     AnySat,
     Clay,
@@ -20,14 +22,8 @@ from spacenit.benchmarks.adapters import (
     Satlas,
     Tessera,
 )
-from spacenit.nn.flexi_vit import (
-    FlexiVitBase,
-    PoolingType,
-    TokensAndMasks,
-)
-from spacenit.nn.pooled_modality_predictor import EncodeEarlyAttnPool
-from spacenit.nn.st_model import STBase
-from spacenit.train.masking import MaskedSpaceNitSample
+from spacenit.benchmarks.datasets.registry import TaskType
+from spacenit.structures import MaskedGeoSample
 
 logger = getLogger(__name__)
 
@@ -43,7 +39,7 @@ class BenchmarkAdapter:
         model: nn.Module,
         task_type: TaskType,
         patch_size: int,
-        pooling_type: PoolingType,
+        pooling_type: str,
         concat_features: bool = False,
         use_pooled_tokens: bool = False,
     ):
@@ -65,10 +61,6 @@ class BenchmarkAdapter:
         self.concat_features = concat_features
         self.spatial_pool = task_type == TaskType.SEGMENTATION
         self.use_pooled_tokens = use_pooled_tokens
-        if self.use_pooled_tokens:
-            assert isinstance(self.model, EncodeEarlyAttnPool), (
-                "Pooled tokens are only supported for EncodeEarlyAttnPool"
-            )
 
     @property
     def device(self) -> torch.device:
@@ -85,12 +77,12 @@ class BenchmarkAdapter:
         return next(self.model.parameters()).device
 
     def __getattr__(self, name: str) -> Any:
-        """Delegate attribute access to the underlying model if the attribute is not found on the adapter."""
+        """Delegate attribute access to the underlying model."""
         return getattr(self.model, name)
 
     def __call__(
         self,
-        masked_spacenit_sample: MaskedSpaceNitSample,
+        sample: MaskedGeoSample,
         labels: torch.Tensor,
         is_train: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -98,49 +90,57 @@ class BenchmarkAdapter:
         raise NotImplementedError("Subclasses must implement this method")
 
 
+def _extract_sensor_data(sample: MaskedGeoSample) -> dict[str, torch.Tensor]:
+    """Convert a MaskedGeoSample into the sensor_data dict the encoder expects."""
+    return {k: sample[k] for k in sample.present_keys if sample[k] is not None}
+
+
+def _pool_tokens(
+    tokens: torch.Tensor,
+    pooling_type: str,
+    spatial_pool: bool = False,
+) -> torch.Tensor:
+    """Pool token embeddings.
+
+    For classification (spatial_pool=False): returns (B, D).
+    For segmentation (spatial_pool=True): returns (B, N, D) to preserve
+    spatial structure.
+    """
+    if spatial_pool:
+        return tokens
+
+    if pooling_type == PoolingType.MEAN:
+        return tokens.mean(dim=1)
+    elif pooling_type == PoolingType.MAX:
+        return tokens.max(dim=1).values
+    else:
+        raise ValueError(f"Unknown pooling type: {pooling_type}")
+
+
 class SpaceNitBenchmarkAdapter(BenchmarkAdapter):
-    """Adapter for SpaceNit models."""
+    """Adapter for SpaceNit models (Encoder, LatentPredictor, etc.)."""
 
     def __call__(
         self,
-        masked_spacenit_sample: MaskedSpaceNitSample,
+        sample: MaskedGeoSample,
         labels: torch.Tensor,
         is_train: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through the model produces the feature specified by initialization."""
-        if not self.use_pooled_tokens:
-            batch_features: TokensAndMasks = self.model(
-                masked_spacenit_sample, patch_size=self.patch_size, fast_pass=True
-            )["tokens_and_masks"]  # (bsz, dim)
-            # Concat features across modalities in space averaged across time
-            batch_features = batch_features.pool_unmasked_tokens(
-                self.pooling_type,
-                spatial_pooling=self.spatial_pool,
-                concat_features=self.concat_features,
-            )
-        else:
-            pooled_tokens_dict = self.model(
-                masked_spacenit_sample, patch_size=self.patch_size, fast_pass=True
-            )["pooled_tokens_and_masks"]
-            pooled_tokens = pooled_tokens_dict["modality_pooled_tokens"]
-            # spatial pool is true means we want to keep the spatial dimensions
-            # so here we just need to pool across time
-            logger.info(f"pooled tokens shape in benchmark adapter: {pooled_tokens.shape}")
+        """Forward pass through the encoder, then pool tokens."""
+        sensor_data = _extract_sensor_data(sample)
 
-            if self.spatial_pool:
-                # B H W T C
-                if pooled_tokens.shape[1] == 1 and pooled_tokens.ndim == 3:
-                    # unsqueeze to get a W H C T
-                    pooled_tokens = pooled_tokens.unsqueeze(1)
-                pooled_tokens = reduce(
-                    pooled_tokens, "b h w ... d -> b h w d", self.pooling_type
-                )
-            else:
-                # Take the mean of all dims except the first and last
-                pooled_tokens = reduce(
-                    pooled_tokens, "b ... d -> b d", self.pooling_type
-                )
-            batch_features = pooled_tokens
+        # Get the encoder -- it may be the model itself or a sub-module
+        encoder = self.model
+        if hasattr(self.model, "encoder"):
+            encoder = self.model.encoder
+
+        encoded, sensor_ids, layout = encoder(
+            sensor_data, patch_size=self.patch_size
+        )
+
+        batch_features = _pool_tokens(
+            encoded, self.pooling_type, spatial_pool=self.spatial_pool
+        )
         return batch_features, labels
 
 
@@ -149,18 +149,17 @@ class PanopticonBenchmarkAdapter(BenchmarkAdapter):
 
     def __call__(
         self,
-        masked_spacenit_sample: MaskedSpaceNitSample,
+        sample: MaskedGeoSample,
         labels: torch.Tensor,
         is_train: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through the model produces the feature specified by initialization."""
         if self.spatial_pool:
             batch_features = self.model.forward_features(
-                masked_spacenit_sample, pooling=self.pooling_type
+                sample, pooling=self.pooling_type
             )
         else:
             batch_features = self.model(
-                masked_spacenit_sample, pooling=self.pooling_type
+                sample, pooling=self.pooling_type
             )
         return batch_features, labels
 
@@ -170,13 +169,12 @@ class GalileoBenchmarkAdapter(BenchmarkAdapter):
 
     def __call__(
         self,
-        masked_spacenit_sample: MaskedSpaceNitSample,
+        sample: MaskedGeoSample,
         labels: torch.Tensor,
         is_train: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through the model produces the feature specified by initialization."""
         features = self.model(
-            masked_spacenit_sample,
+            sample,
             pooling=self.pooling_type,
             spatial_pool=self.spatial_pool,
         )
@@ -188,19 +186,16 @@ class AnySatBenchmarkAdapter(BenchmarkAdapter):
 
     def __call__(
         self,
-        masked_spacenit_sample: MaskedSpaceNitSample,
+        sample: MaskedGeoSample,
         labels: torch.Tensor,
         is_train: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through the model produces the feature specified by initialization."""
         features = self.model(
-            masked_spacenit_sample,
+            sample,
             pooling=self.pooling_type,
             spatial_pool=self.spatial_pool,
         )
         if is_train and (self.task_type == TaskType.SEGMENTATION):
-            # Special case for AnySat: subsample training pixels for segmentation
-            # to keep memory requirements reasonable.
             subsample_by = 1 / 16
             features = rearrange(features, "b h w d -> b (h w) d")
             labels = rearrange(labels, "b h w -> b (h w)")
@@ -225,13 +220,12 @@ class PrithviV2BenchmarkAdapter(BenchmarkAdapter):
 
     def __call__(
         self,
-        masked_spacenit_sample: MaskedSpaceNitSample,
+        sample: MaskedGeoSample,
         labels: torch.Tensor,
         is_train: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through the model produces the feature specified by initialization."""
         features = self.model(
-            masked_spacenit_sample,
+            sample,
             pooling=self.pooling_type,
             spatial_pool=self.spatial_pool,
         )
@@ -243,13 +237,12 @@ class ClayBenchmarkAdapter(BenchmarkAdapter):
 
     def __call__(
         self,
-        masked_spacenit_sample: MaskedSpaceNitSample,
+        sample: MaskedGeoSample,
         labels: torch.Tensor,
         is_train: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through the model produces the feature specified by initialization."""
         batch_features = self.model(
-            masked_spacenit_sample,
+            sample,
             pooling=self.pooling_type,
             spatial_pool=self.spatial_pool,
         )
@@ -261,13 +254,12 @@ class CromaBenchmarkAdapter(BenchmarkAdapter):
 
     def __call__(
         self,
-        masked_spacenit_sample: MaskedSpaceNitSample,
+        sample: MaskedGeoSample,
         labels: torch.Tensor,
         is_train: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through the model produces the feature specified by initialization."""
         batch_features = self.model(
-            masked_spacenit_sample,
+            sample,
             pooling=self.pooling_type,
             spatial_pool=self.spatial_pool,
         )
@@ -279,13 +271,12 @@ class PrestoBenchmarkAdapter(BenchmarkAdapter):
 
     def __call__(
         self,
-        masked_spacenit_sample: MaskedSpaceNitSample,
+        sample: MaskedGeoSample,
         labels: torch.Tensor,
         is_train: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through the model produces the feature specified by initialization."""
         batch_features = self.model(
-            masked_spacenit_sample,
+            sample,
             pooling=self.pooling_type,
             spatial_pool=self.spatial_pool,
         )
@@ -297,19 +288,18 @@ class DINOv3BenchmarkAdapter(BenchmarkAdapter):
 
     def __call__(
         self,
-        masked_spacenit_sample: MaskedSpaceNitSample,
+        sample: MaskedGeoSample,
         labels: torch.Tensor,
         is_train: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through the model produces the feature specified by initialization."""
         if self.spatial_pool:
             batch_features = self.model.forward_features(
-                masked_spacenit_sample,
+                sample,
                 pooling=self.pooling_type,
             )
         else:
             batch_features = self.model(
-                masked_spacenit_sample,
+                sample,
                 pooling=self.pooling_type,
             )
         return batch_features, labels
@@ -320,13 +310,12 @@ class SatlasBenchmarkAdapter(BenchmarkAdapter):
 
     def __call__(
         self,
-        masked_spacenit_sample: MaskedSpaceNitSample,
+        sample: MaskedGeoSample,
         labels: torch.Tensor,
         is_train: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through the model produces the feature specified by initialization."""
         batch_features = self.model(
-            masked_spacenit_sample,
+            sample,
             pooling=self.pooling_type,
             spatial_pool=self.spatial_pool,
         )
@@ -338,13 +327,12 @@ class TesseraBenchmarkAdapter(BenchmarkAdapter):
 
     def __call__(
         self,
-        masked_spacenit_sample: MaskedSpaceNitSample,
+        sample: MaskedGeoSample,
         labels: torch.Tensor,
         is_train: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through the model produces the feature specified by initialization."""
         batch_features = self.model(
-            masked_spacenit_sample,
+            sample,
             pooling=self.pooling_type,
             spatial_pool=self.spatial_pool,
         )
@@ -361,7 +349,8 @@ def get_benchmark_adapter(model: nn.Module, **kwargs: Any) -> BenchmarkAdapter:
     Returns:
         The appropriate benchmark adapter for the given model.
     """
-    if isinstance(model, FlexiVitBase) or isinstance(model, STBase):
+    # SpaceNit's own models
+    if isinstance(model, (Encoder, LatentPredictor, SpatioTemporalEncoder)):
         logger.info("Using SpaceNitBenchmarkAdapter")
         return SpaceNitBenchmarkAdapter(model=model, **kwargs)
     elif isinstance(model, Panopticon):

@@ -37,6 +37,7 @@ from spacenit.arch.embed import (
     TemporalRoPE,
 )
 from spacenit.ingestion.sensors import SensorRegistry, SensorSpec
+from spacenit.settings import Config
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +46,7 @@ from spacenit.ingestion.sensors import SensorRegistry, SensorSpec
 
 
 @dataclass
-class EncoderConfig:
+class EncoderConfig(Config):
     """Configuration for the full encoder pipeline.
 
     Args:
@@ -75,6 +76,10 @@ class EncoderConfig:
     reference_gsd: float = 10.0
     sensor_labels: list[str] = field(default_factory=list)
     rope_theta: float = 10000.0
+
+    def build(self) -> Encoder:
+        """Build an :class:`Encoder` from this configuration."""
+        return Encoder(self)
 
 
 # ---------------------------------------------------------------------------

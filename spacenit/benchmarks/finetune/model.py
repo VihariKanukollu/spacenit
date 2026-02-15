@@ -7,9 +7,9 @@ from typing import cast
 import torch
 import torch.nn as nn
 
-from spacenit.benchmarks.datasets.registry import TaskType
 from spacenit.benchmarks.benchmark_adapter import get_benchmark_adapter
-from spacenit.train.masking import MaskedSpaceNitSample
+from spacenit.benchmarks.datasets.registry import TaskType
+from spacenit.structures import MaskedGeoSample
 
 
 class BackboneWithHead(nn.Module):
@@ -54,7 +54,7 @@ class BackboneWithHead(nn.Module):
         self._inited = True
 
     def forward(
-        self, batch: MaskedSpaceNitSample, labels: torch.Tensor, is_train: bool = True
+        self, batch: MaskedGeoSample, labels: torch.Tensor, is_train: bool = True
     ) -> torch.Tensor:
         """Forward pass through the model and head."""
         dev = next(self.wrapper.parameters()).device
@@ -69,16 +69,16 @@ class BackboneWithHead(nn.Module):
 
 
 def to_device(
-    masked: MaskedSpaceNitSample, device: torch.device
-) -> MaskedSpaceNitSample:
-    """Move a MaskedSpaceNitSample to a device with appropriate dtypes."""
+    masked: MaskedGeoSample, device: torch.device
+) -> MaskedGeoSample:
+    """Move a MaskedGeoSample to a device with appropriate dtypes."""
     d = masked.as_dict(return_none=False)
     for k, v in d.items():
         if k == "timestamps":
             d[k] = v.to(device=device)
         else:
             d[k] = v.to(device=device, dtype=torch.bfloat16)
-    return MaskedSpaceNitSample.from_dict(d)
+    return MaskedGeoSample.from_dict(d)
 
 
 def snapshot_state_dict(module: nn.Module) -> dict[str, torch.Tensor]:

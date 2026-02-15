@@ -1,4 +1,8 @@
-"""SpaceNit training entry point — shared configuration builders."""
+"""SpaceNit training entry point -- shared configuration builders.
+
+Provides the common ``build_*`` functions that per-size scripts
+(``nano.py``, ``base.py``, etc.) import and compose.
+"""
 
 import logging
 
@@ -20,6 +24,7 @@ from olmo_core.train.checkpoint import CheckpointerConfig
 from olmo_core.train.common import Duration, LoadStrategy
 from olmo_core.train.config import TrainerConfig
 
+from spacenit.arch.common import PoolingType
 from spacenit.ingestion.sensors import (
     CDL,
     LANDSAT,
@@ -41,17 +46,12 @@ from spacenit.ops.experiment import (
     SpaceNitVisualizeConfig,
     SubCmd,
 )
-from spacenit.arch.adaptive_vision_encoder import (
-    PoolingType,
-)
 from spacenit.pipeline.hooks.downstream_eval import (
     DownstreamEvalHookConfig,
     DownstreamTaskConfig,
 )
 from spacenit.pipeline.hooks.throughput_monitor import SpaceNitThroughputMonitor
 from spacenit.pipeline.hooks.experiment_logger import SpaceNitExperimentLogger
-from spacenit.pipeline.objectives import ObjectiveConfig
-from spacenit.pipeline.occlusion import OcclusionConfig
 from spacenit.pipeline.runners.contrastive_latent import (
     ContrastiveLatentRunnerConfig,
 )
@@ -81,29 +81,26 @@ def build_common_components(
     return config
 
 
-def get_occlusion_config(common: CommonComponents) -> OcclusionConfig:
-    """Get the occlusion configuration for the experiment.
+def get_masking_config() -> dict:
+    """Build the masking strategy configuration.
 
-    Args:
-        common: Common experiment components containing optional tokenization_config.
+    Uses cross-sensor random masking: 50 % of tokens are visible to the
+    encoder, 50 % are prediction targets.  Low-information sensors
+    (land-cover, elevation, etc.) are decode-only.
     """
-    return OcclusionConfig(
-        strategy_config={
-            "type": "modality_cross_random",
-            "encode_ratio": 0.5,
-            "decode_ratio": 0.5,
-            "allow_encoding_decoding_same_bandset": True,
-            "only_decode_modalities": [
-                WORLDCOVER.label,
-                SRTM.label,
-                OPENSTREETMAP_RASTER.label,
-                WRI_CANOPY_HEIGHT_MAP.label,
-                CDL.label,
-                WORLDCEREAL.label,
-            ],
-        },
-        tokenization_config=common.tokenization_config,
-    )
+    return {
+        "type": "cross_sensor_random",
+        "encode_ratio": 0.5,
+        "decode_ratio": 0.5,
+        "decode_only_sensors": [
+            WORLDCOVER.label,
+            SRTM.label,
+            OPENSTREETMAP_RASTER.label,
+            WRI_CANOPY_HEIGHT_MAP.label,
+            CDL.label,
+            WORLDCEREAL.label,
+        ],
+    }
 
 
 def build_train_module_config(
@@ -114,28 +111,14 @@ def build_train_module_config(
     Args:
         common: Common experiment components.
     """
-    # The train module still needs the occlusion_config for reference (e.g., for metric
-    # naming), but the actual masking happens in the dataloader workers.
     return ContrastiveLatentRunnerConfig(
         optim_config=AdamWConfig(lr=0.0001, weight_decay=0.02, fused=False),
         rank_microbatch_size=32,
-        occlusion_config=get_occlusion_config(common),
-        loss_config=ObjectiveConfig(
-            loss_config={
-                "type": "modality_patch_discrimination_new",
-                "tau": 0.1,
-            }
-        ),
-        contrastive_config=ObjectiveConfig(
-            loss_config={
-                "type": "InfoNCE",
-                "weight": 0.1,
-            }
-        ),
-        token_exit_cfg={modality: 0 for modality in common.training_modalities},
+        masking_config=get_masking_config(),
+        contrastive_temperature=0.1,
+        uniformity_weight=0.1,
         max_grad_norm=1.0,
         scheduler=CosWithWarmup(warmup_steps=8000),
-        ema_decay=(1.0, 1.0),
         dp_config=DataParallelConfig(
             name=DataParallelType.fsdp,
             param_dtype=DType.bfloat16,
@@ -149,10 +132,6 @@ def build_dataloader_config(
 ) -> GeoTileLoaderConfig:
     """Build the dataloader config for an experiment.
 
-    Masking is performed in the dataloader workers (CPU) instead of in the train module
-    (GPU). This improves throughput by offloading CPU-bound masking operations to
-    dataloader workers.
-
     Args:
         common: Common experiment components.
     """
@@ -161,14 +140,12 @@ def build_dataloader_config(
         global_batch_size=512,
         token_budget=2250,
         prefetch_factor=2,
-        sampled_hw_p_list=list(range(1, 13)),  # try only temporal tokens
+        sampled_hw_p_list=list(range(1, 13)),
         min_patch_size=MIN_PATCH_SIZE,
         max_patch_size=MAX_PATCH_SIZE,
         work_dir=common.save_folder,
         seed=3622,
-        num_masked_views=2,  # ContrastiveLatentRunner needs 2 views
-        occlusion_config=get_occlusion_config(common),
-        # occlusion_config_b is not set, so both views use the same strategy
+        num_masked_views=2,
         tokenization_config=common.tokenization_config,
     )
 
@@ -196,9 +173,8 @@ def build_trainer_config(common: CommonComponents) -> TrainerConfig:
         name=common.run_name,
         project=WANDB_PROJECT,
         entity=WANDB_USERNAME,
-        enabled=True,  # set to False to avoid wandb errors
+        enabled=True,
     )
-    # Safe to collect every step for now
     garbage_collector_callback = GarbageCollectorCallback(gc_interval=1)
     EVAL_TASKS = {
         "m-eurosat": DownstreamTaskConfig(

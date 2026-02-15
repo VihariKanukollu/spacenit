@@ -11,48 +11,29 @@ from script import (
     build_visualize_config,
 )
 
+from spacenit.arch.encoder import EncoderConfig
+from spacenit.arch.models import LatentPredictorConfig
 from spacenit.ops.experiment import CommonComponents, main
 from spacenit.ops.helpers import MODEL_SIZE_ARGS
-from spacenit.arch.adaptive_vision_encoder import (
-    EncoderConfig,
-    PredictorConfig,
-)
-from spacenit.arch.latent_masked_prediction import LatentMIMConfig
 
 logger = logging.getLogger(__name__)
 
-MAX_PATCH_SIZE = 8
-MIN_PATCH_SIZE = 1
 
-
-def build_model_config(common: CommonComponents) -> LatentMIMConfig:
-    """Build the model config for an experiment."""
+def build_model_config(common: CommonComponents) -> LatentPredictorConfig:
+    """Build the model config for a Base experiment."""
     model_size = MODEL_SIZE_ARGS["base_shallow_decoder"]
 
-    encoder_config = EncoderConfig(
-        embedding_size=model_size["encoder_embedding_size"],
-        num_heads=model_size["encoder_num_heads"],
-        depth=model_size["encoder_depth"],
-        mlp_ratio=model_size["mlp_ratio"],
-        supported_modality_names=common.training_modalities,
-        max_patch_size=MAX_PATCH_SIZE,
-        drop_path=0.1,
-        max_sequence_length=12,
+    return LatentPredictorConfig(
+        encoder=EncoderConfig(
+            embed_dim=model_size["encoder_embedding_size"],
+            num_heads=model_size["encoder_num_heads"],
+            depth=model_size["encoder_depth"],
+            ffn_expansion=model_size["mlp_ratio"],
+            sensor_labels=common.training_modalities,
+        ),
+        decoder_depth=model_size["decoder_depth"],
+        decoder_num_heads=model_size["decoder_num_heads"],
     )
-    decoder_config = PredictorConfig(
-        encoder_embedding_size=model_size["encoder_embedding_size"],
-        decoder_embedding_size=model_size["decoder_embedding_size"],
-        depth=model_size["decoder_depth"],
-        mlp_ratio=model_size["mlp_ratio"],
-        num_heads=model_size["decoder_num_heads"],
-        supported_modality_names=common.training_modalities,
-        max_sequence_length=12,
-    )
-    model_config = LatentMIMConfig(
-        encoder_config=encoder_config,
-        decoder_config=decoder_config,
-    )
-    return model_config
 
 
 if __name__ == "__main__":

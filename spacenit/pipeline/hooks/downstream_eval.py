@@ -17,30 +17,29 @@ from olmo_core.train.common import Duration
 from olmo_core.train.trainer import Trainer
 from torch.utils.data import DataLoader
 
-from spacenit.ingestion.sensors import SensorRegistry
-from spacenit.evals.datasets import (
-    EvalDatasetPartition,
-    get_eval_dataset,
+from spacenit.arch.common import PoolingType
+from spacenit.benchmarks.benchmark_adapter import get_benchmark_adapter
+from spacenit.benchmarks.datasets import (
+    BenchmarkDatasetPartition,
+    get_benchmark_dataset,
 )
-from spacenit.evals.datasets.configs import (
-    EvalDatasetConfig,
+from spacenit.benchmarks.datasets.band_scaling import NormMethod
+from spacenit.benchmarks.datasets.helpers import benchmark_collate_fn
+from spacenit.benchmarks.datasets.registry import (
+    BenchmarkDatasetConfig,
     TaskType,
     dataset_to_config,
-    get_eval_mode,
 )
-from spacenit.evals.datasets.normalize import NormMethod
-from spacenit.evals.datasets.utils import eval_collate_fn
-from spacenit.evals.embedding_transforms import (
-    dequantize_embeddings,
-    reduce_embedding_dim,
+from spacenit.benchmarks.feature_extraction import get_features
+from spacenit.benchmarks.feature_transforms import (
+    dequantize_features,
+    reduce_feature_dim,
 )
-from spacenit.evals.embeddings import get_embeddings
-from spacenit.evals.eval_wrapper import get_eval_wrapper
-from spacenit.evals.finetune import run_finetune_eval
-from spacenit.evals.knn import run_knn
-from spacenit.evals.linear_probe import ProbeType, train_and_eval_probe
-from spacenit.evals.metrics import EvalResult, EvalTaskResult
-from spacenit.arch.adaptive_vision_encoder import PoolingType
+from spacenit.benchmarks.finetune.train import run_finetune_benchmark
+from spacenit.benchmarks.knn_eval import run_knn
+from spacenit.benchmarks.linear_probe import ProbeType, train_and_eval_probe
+from spacenit.benchmarks.scoring import BenchmarkResult, BenchmarkTaskResult
+from spacenit.ingestion.sensors import SensorRegistry
 from spacenit.pipeline.hooks.experiment_logger import SpaceNitExperimentLogger
 
 logger = logging.getLogger(__name__)
@@ -60,6 +59,13 @@ class EvalMode(StrEnum):
     KNN = "knn"
     LINEAR_PROBE = "linear_probe"
     FINETUNE = "finetune"
+
+
+def _default_eval_mode(task_type: TaskType) -> EvalMode:
+    """Return the default eval mode for a given task type."""
+    if task_type == TaskType.CLASSIFICATION:
+        return EvalMode.KNN
+    return EvalMode.LINEAR_PROBE
 
 
 @dataclass
@@ -92,7 +98,7 @@ class DownstreamTaskConfig:
     eval_mode: EvalMode | None = None
     probe_type: ProbeType = ProbeType.LINEAR
     use_pooled_tokens: bool = False
-    partition: str = field(default_factory=lambda: EvalDatasetPartition.TRAIN1X)
+    partition: str = field(default_factory=lambda: BenchmarkDatasetPartition.TRAIN1X)
     norm_method: NormMethod = field(default_factory=lambda: NormMethod.NORM_NO_CLIP)
     select_final_test_miou_based_on_epoch_of_max_val_miou: bool = False
     # Quantize embeddings to int8 for storage efficiency evaluation
@@ -166,7 +172,7 @@ class DownstreamEvalRunner:
                 "run_on_test must be True"
             )
         if self.eval_mode is None:
-            self.eval_mode = get_eval_mode(self.config.task_type)  # type: ignore
+            self.eval_mode = _default_eval_mode(self.config.task_type)  # type: ignore
         if isinstance(self.eval_mode, str) and self.eval_mode is not None:
             self.eval_mode = EvalMode(self.eval_mode)
 
@@ -232,8 +238,8 @@ class DownstreamEvalRunner:
             worker_init_fn = partial(_seed_worker, base_seed=split_seed)
 
         return DataLoader(
-            get_eval_dataset(
-                eval_dataset=self.dataset,
+            get_benchmark_dataset(
+                benchmark_dataset=self.dataset,
                 split=split,
                 partition=self.partition,
                 norm_stats_from_pretrained=self.norm_stats_from_pretrained,
@@ -241,7 +247,7 @@ class DownstreamEvalRunner:
                 input_layers=self.input_layers,
                 norm_method=self.norm_method,
             ),
-            collate_fn=eval_collate_fn,
+            collate_fn=benchmark_collate_fn,
             batch_size=batch_size,
             num_workers=self.num_workers,
             generator=generator,
@@ -249,7 +255,7 @@ class DownstreamEvalRunner:
             shuffle=(split == "train"),  # Only shuffle train data
         )
 
-    def _get_embeddings(
+    def _get_features(
         self, data_loader: DataLoader, is_train: bool
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Get the embeddings for the given data loader."""
@@ -278,15 +284,15 @@ class DownstreamEvalRunner:
             "concat_features": (self.probe_type == "attn_pool"),
             "use_pooled_tokens": self.use_pooled_tokens,
         }
-        model = get_eval_wrapper(model, **wrapper_kwargs)
-        return get_embeddings(
+        model = get_benchmark_adapter(model, **wrapper_kwargs)
+        return get_features(
             data_loader=data_loader,
             model=model,
             is_train=is_train,
             quantize=self.quantize_embeddings,
         )
 
-    def _val_embed_probe(self) -> EvalTaskResult:
+    def _val_embed_probe(self) -> BenchmarkTaskResult:
         """Validate the model using embeddings and probe (knn or linear probe)."""
         logger.info(f"Validating {self.dataset} with {self.eval_mode}")
         train_loader = self._get_data_loader("train", self.embedding_batch_size)
@@ -295,14 +301,14 @@ class DownstreamEvalRunner:
 
         start_time = time.time()
         logger.info(f"Getting train embeddings for {self.dataset}...")
-        train_embeddings, train_labels = self._get_embeddings(
+        train_embeddings, train_labels = self._get_features(
             train_loader, is_train=True
         )
         logger.info(f"Getting val embeddings for {self.dataset}...")
-        val_embeddings, val_labels = self._get_embeddings(val_loader, is_train=False)
+        val_embeddings, val_labels = self._get_features(val_loader, is_train=False)
         if self.run_on_test:
             logger.info(f"Getting test embeddings for {self.dataset}...")
-            test_embeddings, test_labels = self._get_embeddings(
+            test_embeddings, test_labels = self._get_features(
                 test_loader, is_train=False
             )
         else:
@@ -327,10 +333,10 @@ class DownstreamEvalRunner:
         # Dequantize if embeddings were quantized
         if self.quantize_embeddings:
             logger.info(f"Dequantizing embeddings for {self.dataset}")
-            train_embeddings = dequantize_embeddings(train_embeddings)
-            val_embeddings = dequantize_embeddings(val_embeddings)
+            train_embeddings = dequantize_features(train_embeddings)
+            val_embeddings = dequantize_features(val_embeddings)
             if test_embeddings is not None:
-                test_embeddings = dequantize_embeddings(test_embeddings)
+                test_embeddings = dequantize_features(test_embeddings)
 
         # Reduce embedding dimensionality via PCA if specified
         if self.embedding_dim is not None:
@@ -339,7 +345,7 @@ class DownstreamEvalRunner:
                 f"Reducing embeddings from {original_dim} to {self.embedding_dim} dims for {self.dataset}"
             )
             train_embeddings, val_embeddings, test_embeddings, variance_retained = (
-                reduce_embedding_dim(
+                reduce_feature_dim(
                     train_embeddings,
                     val_embeddings,
                     test_embeddings,
@@ -389,7 +395,7 @@ class DownstreamEvalRunner:
         )
         return resume_checkpoint_path
 
-    def _val_finetune(self) -> EvalTaskResult:
+    def _val_finetune(self) -> BenchmarkTaskResult:
         """Validate the model using finetuning."""
         logger.info(f"Validating {self.dataset} with finetune")
 
@@ -439,7 +445,7 @@ class DownstreamEvalRunner:
         else:
             logger.info("No resume checkpoint found, starting fresh")
 
-        result = run_finetune_eval(
+        result = run_finetune_benchmark(
             task_name=self.evaluation_name,
             task_config=self.config,
             trainer=self.trainer,
@@ -466,7 +472,7 @@ class DownstreamEvalRunner:
         gc.collect()
         return result
 
-    def val(self) -> EvalTaskResult:
+    def val(self) -> BenchmarkTaskResult:
         """Validate the model on the downstream task."""
         if self.eval_mode in (EvalMode.KNN, EvalMode.LINEAR_PROBE):
             return self._val_embed_probe()
@@ -477,18 +483,18 @@ class DownstreamEvalRunner:
 
 
 def _log_eval_result_to_wandb(
-    wandb_callback: Any, prefix: str, name: str, result: EvalResult
+    wandb_callback: Any, prefix: str, name: str, result: BenchmarkResult
 ) -> None:
-    """Log an EvalResult to wandb."""
+    """Log an BenchmarkResult to wandb."""
     for metric_name, metric_value in result.metrics.items():
         wandb_callback.wandb.log({f"{prefix}/{name}/{metric_name}": metric_value})
     wandb_callback.wandb.log({f"{prefix}/{name}": result.primary})
 
 
 def _record_eval_result(
-    trainer: Trainer, prefix: str, name: str, result: EvalResult
+    trainer: Trainer, prefix: str, name: str, result: BenchmarkResult
 ) -> None:
-    """Record an EvalResult to trainer metrics."""
+    """Record an BenchmarkResult to trainer metrics."""
     for metric_name, metric_value in result.metrics.items():
         trainer.record_metric(f"{prefix}/{name}/{metric_name}", metric_value)
     trainer.record_metric(f"{prefix}/{name}", result.primary)
@@ -556,7 +562,7 @@ class DownstreamEvalHook(Callback):
         return required_modalities_present and has_timeseries
 
     def _log_eval_results_to_logger_pretrain(
-        self, evaluator: DownstreamEvalRunner, result: EvalTaskResult
+        self, evaluator: DownstreamEvalRunner, result: BenchmarkTaskResult
     ) -> None:
         """Log the evaluation results."""
         val_result = result.val_result
@@ -582,7 +588,7 @@ class DownstreamEvalHook(Callback):
             )
 
     def _log_eval_results_to_wandb_pretrain(
-        self, evaluator: DownstreamEvalRunner, result: EvalTaskResult
+        self, evaluator: DownstreamEvalRunner, result: BenchmarkTaskResult
     ) -> None:
         """Log the evaluation results to wandb."""
         wandb_callback = next(
@@ -679,7 +685,7 @@ class DownstreamEvalHook(Callback):
                 continue
             self._perform_eval(evaluator)
 
-    def _perform_eval(self, evaluator: DownstreamEvalRunner) -> EvalTaskResult:
+    def _perform_eval(self, evaluator: DownstreamEvalRunner) -> BenchmarkTaskResult:
         """Run the evaluator."""
         logger.info(f"Running {evaluator.evaluation_name} evaluations...")
         start_time = time.monotonic()
@@ -739,7 +745,7 @@ class DownstreamEvalHookConfig(CallbackConfig):
     bootstrap_seed: int = 42
 
     def verify_input_modalities(
-        self, task: DownstreamTaskConfig, config: EvalDatasetConfig
+        self, task: DownstreamTaskConfig, config: BenchmarkDatasetConfig
     ) -> None:
         """Verify the input modality configuration for a task."""
         if (task.dataset not in ["pastis", "pastis128", "nandi", "awf"]) and len(

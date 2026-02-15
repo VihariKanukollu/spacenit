@@ -12,9 +12,9 @@ from einops import repeat
 from PIL import Image
 from torch.utils.data import Dataset
 
-from spacenit.data.constants import Sensor
-from spacenit.data.dataset import SpaceNitSample
-from spacenit.train.masking import MaskedSpaceNitSample
+from spacenit.ingestion.sensors import SENTINEL2_L2A, SENTINEL1, LANDSAT, SRTM
+from spacenit.structures import GeoSample
+from spacenit.structures import MaskedGeoSample
 
 from .constants import BENCH_S2_BAND_NAMES, BENCH_TO_SPACENIT_S2_BANDS
 from .band_scaling import normalize_bands
@@ -239,9 +239,9 @@ class MarineDebrisDataset(Dataset):
         self.norm_stats_from_pretrained = norm_stats_from_pretrained
         # If normalize with pretrained stats, we initialize the normalizer here
         if self.norm_stats_from_pretrained:
-            from spacenit.data.normalize import Normalizer, Strategy
+            from spacenit.ingestion.standardizer import Standardizer, Strategy
 
-            self.normalizer_computed = Normalizer(Strategy.COMPUTED)
+            self.normalizer_computed = Standardizer(Strategy.COMPUTED)
 
         torch_obj = torch.load(path_to_splits / f"MADOS_{split}.pt")
         self.images = torch_obj["images"]
@@ -274,7 +274,7 @@ class MarineDebrisDataset(Dataset):
         """Length of the dataset."""
         return self.images.shape[0]
 
-    def __getitem__(self, idx: int) -> tuple[MaskedSpaceNitSample, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[MaskedGeoSample, torch.Tensor]:
         """Return a single marine debris data instance."""
         image = self.images[idx]  # (80, 80, 13)
         label = self.labels[idx]  # (80, 80)
@@ -296,11 +296,11 @@ class MarineDebrisDataset(Dataset):
         ]
 
         if self.norm_stats_from_pretrained:
-            image = self.normalizer_computed.normalize(Sensor.SENTINEL2_L2A, image)
+            image = self.normalizer_computed.normalize(SENTINEL2_L2A, image)
 
         timestamp = repeat(torch.tensor(self.default_day_month_year), "d -> t d", t=1)
-        masked_sample = MaskedSpaceNitSample.from_spacenitsample(
-            SpaceNitSample(
+        masked_sample = MaskedGeoSample.from_spacenitsample(
+            GeoSample(
                 sentinel2_l2a=torch.tensor(image).float(), timestamps=timestamp.long()
             )
         )

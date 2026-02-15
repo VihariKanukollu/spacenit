@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from upath import UPath
 
-from spacenit.data.constants import Sensor
+from spacenit.ingestion.sensors import SENTINEL2_L2A, SENTINEL1
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +81,8 @@ class CropParcelsProcessor:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Aggregate images into monthly averages."""
         if (
-            modality_name != Sensor.SENTINEL2_L2A.label
-            and modality_name != Sensor.SENTINEL1.label
+            modality_name != SENTINEL2_L2A.label
+            and modality_name != SENTINEL1.label
         ):
             raise ValueError(
                 f"Unsupported modality: {modality_name} for PASTIS dataset!"
@@ -96,7 +96,7 @@ class CropParcelsProcessor:
             month = str(date)[:6]
             img = torch.tensor(images[int(idx)], dtype=torch.float32)
             # S2 in PASTIS has 10 bands, so imputation is always needed
-            if modality_name == Sensor.SENTINEL2_L2A.label:
+            if modality_name == SENTINEL2_L2A.label:
                 if img.shape[0] == 10:
                     img = self.impute(img)
                 else:
@@ -139,9 +139,9 @@ class CropParcelsProcessor:
         # Only extract the first two bands (vv/vh) for S1
         s1_images = s1_images[:, :2, ...]
         s2_images, months = self.aggregate_months(
-            Sensor.SENTINEL2_L2A.label, s2_images, dates
+            SENTINEL2_L2A.label, s2_images, dates
         )
-        s1_images, _ = self.aggregate_months(Sensor.SENTINEL1.label, s1_images, dates)
+        s1_images, _ = self.aggregate_months(SENTINEL1.label, s1_images, dates)
 
         targets = torch.tensor(targets, dtype=torch.long)
         # PASTIS has 19 classes, the last one is void label, convert it to -1 to ignore

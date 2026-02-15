@@ -44,10 +44,10 @@ logger = getLogger(__name__)
 
 def _get_wandb_logger(trainer: Trainer) -> Any | None:
     """Return the wandb module from the SpaceNit callback, if available."""
-    from spacenit.train.callbacks.wandb import SpaceNitWandBCallback
+    from spacenit.pipeline.hooks.experiment_logger import SpaceNitExperimentLogger
 
     for callback in trainer._iter_callbacks():
-        if isinstance(callback, SpaceNitWandBCallback) and callback.enabled:
+        if isinstance(callback, SpaceNitExperimentLogger) and callback.enabled:
             return callback.wandb
     return None
 

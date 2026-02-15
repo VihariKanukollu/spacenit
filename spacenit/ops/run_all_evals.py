@@ -19,18 +19,18 @@ from olmo_core.train.checkpoint import CheckpointerConfig
 from olmo_core.train.common import Duration, LoadStrategy
 from olmo_core.train.config import TrainerConfig
 
-from spacenit.benchmarks.datasets.normalize import NormMethod
+from spacenit.arch.common import PoolingType
+from spacenit.benchmarks.datasets.band_scaling import NormMethod
 from spacenit.ops.constants import EVAL_WANDB_PROJECT, WANDB_ENTITY
 from spacenit.ops.experiment import (
     CommonComponents,
     main,
 )
-from spacenit.arch.adaptive_vision_encoder import PoolingType
 from spacenit.pipeline.hooks import (
-    DownstreamEvaluatorCallbackConfig,
-    SpaceNitWandBCallback,
+    DownstreamEvalHookConfig,
+    SpaceNitExperimentLogger,
 )
-from spacenit.pipeline.hooks.evaluator_callback import (
+from spacenit.pipeline.hooks.downstream_eval import (
     DownstreamTaskConfig,
     EvalMode,
 )
@@ -140,13 +140,11 @@ def build_trainer_config(common: CommonComponents) -> TrainerConfig:
     CANCEL_CHECK_INTERVAL = 1
     LOAD_STRATEGY = LoadStrategy.if_available
     checkpointer_config = CheckpointerConfig(work_dir=common.save_folder)
-    wandb_callback = SpaceNitWandBCallback(
+    wandb_callback = SpaceNitExperimentLogger(
         name=common.run_name,
         project=EVAL_WANDB_PROJECT,
         entity=WANDB_ENTITY,
         enabled=True,
-        upload_dataset_distribution_pre_train=False,
-        upload_modality_data_band_distribution_pre_train=False,
     )
     garbage_collector_callback = GarbageCollectorCallback(gc_interval=1)
     trainer_config = (
@@ -164,7 +162,7 @@ def build_trainer_config(common: CommonComponents) -> TrainerConfig:
         .with_callback("config_saver", ConfigSaverCallback())
         .with_callback(
             "downstream_evaluator",
-            DownstreamEvaluatorCallbackConfig(
+            DownstreamEvalHookConfig(
                 tasks=FT_EVAL_TASKS if os.environ.get("FINETUNE") else EVAL_TASKS,
                 eval_on_startup=True,
                 cancel_after_first_eval=True,

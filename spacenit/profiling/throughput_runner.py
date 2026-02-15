@@ -16,7 +16,8 @@ from olmo_core.io import copy_file, file_exists, join_path
 from olmo_core.train.callbacks import ProfilerCallback, WandBCallback
 from olmo_core.train.trainer import PathOrStr
 
-from spacenit.settings import Config
+from spacenit.arch.encoder import Encoder, EncoderConfig
+from spacenit.arch.models import LatentPredictorConfig
 from spacenit.ingestion.sensors import (
     LANDSAT,
     REFERENCE_GROUND_RESOLUTION,
@@ -24,17 +25,11 @@ from spacenit.ingestion.sensors import (
     SENTINEL2,
     SENTINEL2_L2A,
 )
-from spacenit.structures import MaskedSpaceNitSample, MaskValue
+from spacenit.ops.helpers import MODEL_SIZE_ARGS
 from spacenit.profiling import constants
 from spacenit.profiling.run_config import RunParams
-from spacenit.ops.helpers import MODEL_SIZE_ARGS
-from spacenit.arch.adaptive_vision_encoder import (
-    Encoder,
-    EncoderConfig,
-    PredictorConfig,
-    TokensAndMasks,
-)
-from spacenit.arch.latent_masked_prediction import LatentMIMConfig
+from spacenit.settings import Config
+from spacenit.structures import MaskedGeoSample, TokenVisibility
 
 NUM_S1_BANDS = SENTINEL1.total_channels
 NUM_S2_BANDS = SENTINEL2.total_channels
@@ -83,58 +78,41 @@ class SpaceNitEncoder(torch.nn.Module):
         super().__init__()
 
         model = model_config.build()
-        model = getattr(model, "encoder")
-
-        self.model: Encoder = model
+        self.model: Encoder = getattr(model, "encoder")
         self.model.eval()
-        self.model.apply_compile()
 
     def forward(
         self,
-        x: MaskedSpaceNitSample,
+        sensor_data: dict[str, torch.Tensor],
         patch_size: int,
-        fast_pass: bool = True,
-    ) -> TokensAndMasks:
-        """Pass-through."""
-        return self.model.forward(
-            x,
-            patch_size=patch_size,
-            fast_pass=fast_pass,
-        )["tokens_and_masks"]
+    ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[str, int]]]:
+        """Encode sensor data and return (encoded, sensor_ids, layout)."""
+        return self.model.forward(sensor_data, patch_size=patch_size)
 
 
 def build_default_model_config(
     run_params: RunParams, training_modalities: list[str]
-) -> LatentMIMConfig:
+) -> LatentPredictorConfig:
     """Default model config builder based on model_size.
 
     Args:
         run_params: The run parameters containing model_size.
-        training_modalities: List of modality names to support.
+        training_modalities: List of sensor labels to support.
 
     Returns:
-        A LatentMIMConfig for building the model.
+        A LatentPredictorConfig for building the model.
     """
     model_size = MODEL_SIZE_ARGS[run_params.model_size]
-    encoder_config = EncoderConfig(
-        embedding_size=int(model_size["encoder_embedding_size"]),
-        num_heads=int(model_size["encoder_num_heads"]),
-        depth=int(model_size["encoder_depth"]),
-        mlp_ratio=float(model_size["mlp_ratio"]),
-        supported_modality_names=training_modalities,
-    )
-    decoder_config = PredictorConfig(
-        encoder_embedding_size=int(model_size["encoder_embedding_size"]),
-        decoder_embedding_size=int(model_size["decoder_embedding_size"]),
-        depth=int(model_size["decoder_depth"]),
-        mlp_ratio=float(model_size["mlp_ratio"]),
-        num_heads=int(model_size["decoder_num_heads"]),
-        supported_modality_names=training_modalities,
-        max_sequence_length=12,
-    )
-    return LatentMIMConfig(
-        encoder_config=encoder_config,
-        decoder_config=decoder_config,
+    return LatentPredictorConfig(
+        encoder=EncoderConfig(
+            embed_dim=int(model_size["encoder_embedding_size"]),
+            num_heads=int(model_size["encoder_num_heads"]),
+            depth=int(model_size["encoder_depth"]),
+            ffn_expansion=float(model_size["mlp_ratio"]),
+            sensor_labels=training_modalities,
+        ),
+        decoder_depth=int(model_size["decoder_depth"]),
+        decoder_num_heads=int(model_size["decoder_num_heads"]),
     )
 
 
@@ -196,15 +174,6 @@ class ThroughputBenchmarkRunnerConfig(Config):
         )
 
 
-def calculate_num_token_embeddings(t: torch.Tensor | None) -> int:
-    """Determines how many tokens are represented in the given tensor."""
-    if t is not None:
-        batch_size, p_height, p_width, timestamps, bandsets, _ = tuple(t.shape)
-        return batch_size * p_height * p_width * timestamps * bandsets
-
-    return 0
-
-
 class ThroughputBenchmarkRunner:
     """Runner for a throughput benchmarking run."""
 
@@ -219,18 +188,7 @@ class ThroughputBenchmarkRunner:
         cross_product_sweep: bool = False,
         model_config: Any | None = None,
     ):
-        """Initializes the throughput benchmarking runner.
-
-        Args:
-            default_run_params: Default parameters for benchmark runs.
-            sweep_group_name: Name for the sweep group (used for logging).
-            training_modalities: List of modality names to use.
-            work_dir: Working directory for benchmark outputs.
-            save_folder: Optional folder to save results.
-            sweep_dict: Dictionary mapping parameter names to values to sweep.
-            cross_product_sweep: If True, sweep all combinations of parameters.
-            model_config: Optional pre-built model config.
-        """
+        """Initializes the throughput benchmarking runner."""
         self.default_run_params = default_run_params
         self.sweep_group_name = sweep_group_name
         self.training_modalities = training_modalities
@@ -244,11 +202,7 @@ class ThroughputBenchmarkRunner:
         self.sweep_name = "_".join(self.sweep_dict.keys()) + "-" + uuid_str
 
     def build_model(self, run_params: RunParams) -> SpaceNitEncoder:
-        """Builds a model based on the run parameters.
-
-        Uses the pre-built model_config if provided, otherwise uses
-        build_default_model_config() to create the model config.
-        """
+        """Builds a model based on the run parameters."""
         if self.model_config is not None:
             model_config = self.model_config
         else:
@@ -288,11 +242,7 @@ class ThroughputBenchmarkRunner:
                 continue
 
     def run_benchmarking(self, run_params: RunParams) -> None:
-        """Runs the benchmarking code.
-
-        Requires an instance of the SpaceNit encoder wrapper, a wandb metrics
-        instance, and run params.
-        """
+        """Runs the benchmarking code."""
         model = self.build_model(run_params)
         if torch.cuda.is_available() and run_params.gpu_type == "cuda":
             logger.info("Model loaded and on gpu")
@@ -334,21 +284,10 @@ class ThroughputBenchmarkRunner:
         for callback in callbacks:
             callback.pre_train()
 
-        if run_params.use_s1:
-            s1_tensor = torch.rand(
-                batch_size,
-                run_params.image_size,
-                run_params.image_size,
-                run_params.num_timesteps,
-                NUM_S1_BANDS,
-                device=device,
-                dtype=dtype,
-            )
-        else:
-            s1_tensor = None
-
+        # Build synthetic sensor data dict
+        sensor_data: dict[str, torch.Tensor] = {}
         if run_params.use_s2:
-            s2_tensor = torch.rand(
+            sensor_data[SENTINEL2_L2A.label] = torch.rand(
                 batch_size,
                 run_params.image_size,
                 run_params.image_size,
@@ -357,11 +296,18 @@ class ThroughputBenchmarkRunner:
                 device=device,
                 dtype=dtype,
             )
-        else:
-            s2_tensor = None
-
+        if run_params.use_s1:
+            sensor_data[SENTINEL1.label] = torch.rand(
+                batch_size,
+                run_params.image_size,
+                run_params.image_size,
+                run_params.num_timesteps,
+                NUM_S1_BANDS,
+                device=device,
+                dtype=dtype,
+            )
         if run_params.use_landsat:
-            landsat_tensor = torch.rand(
+            sensor_data[LANDSAT.label] = torch.rand(
                 batch_size,
                 run_params.image_size,
                 run_params.image_size,
@@ -370,36 +316,10 @@ class ThroughputBenchmarkRunner:
                 device=device,
                 dtype=dtype,
             )
-        else:
-            landsat_tensor = None
 
-        latlon = torch.rand(batch_size, 2, device=device, dtype=dtype)
-        timestamps = torch.ones(
-            batch_size, run_params.num_timesteps, 3, dtype=torch.int32, device=device
-        )
-
-        def maybe_make_mask(maybe_t: torch.Tensor | None) -> torch.Tensor | None:
-            if maybe_t is not None:
-                return (
-                    torch.ones(
-                        maybe_t.shape,
-                        dtype=dtype,
-                        device=device,
-                    )
-                    * MaskValue.ONLINE_ENCODER.value
-                )
-            return None
-
-        masked_sample = MaskedSpaceNitSample(
-            timestamps=timestamps,
-            sentinel2_l2a=s2_tensor,
-            sentinel2_l2a_mask=maybe_make_mask(s2_tensor),
-            sentinel1=s1_tensor,
-            sentinel1_mask=maybe_make_mask(s1_tensor),
-            landsat=landsat_tensor,
-            landsat_mask=maybe_make_mask(landsat_tensor),
-            latlon=latlon,
-            latlon_mask=maybe_make_mask(latlon),
+        total_tokens_per_batch = sum(
+            t.shape[0] * t.shape[1] * t.shape[2] * t.shape[3]
+            for t in sensor_data.values()
         )
 
         tokens_processed_per_batch: list[int] = []
@@ -414,12 +334,12 @@ class ThroughputBenchmarkRunner:
                         with torch.amp.autocast(
                             device_type=device.type, dtype=torch.bfloat16
                         ):
-                            results = model.forward(
-                                masked_sample, patch_size=run_params.patch_size
+                            encoded, sensor_ids, layout = model.forward(
+                                sensor_data, patch_size=run_params.patch_size
                             )
                     else:
-                        results = model.forward(
-                            masked_sample, patch_size=run_params.patch_size
+                        encoded, sensor_ids, layout = model.forward(
+                            sensor_data, patch_size=run_params.patch_size
                         )
             except torch.cuda.OutOfMemoryError as e:
                 logger.error(f"CUDA OOM during warmup: {e}")
@@ -455,25 +375,23 @@ class ThroughputBenchmarkRunner:
                     with torch.amp.autocast(
                         device_type=device.type, dtype=torch.bfloat16
                     ):
-                        results = model.forward(
-                            masked_sample,
+                        encoded, sensor_ids, layout = model.forward(
+                            sensor_data,
                             patch_size=run_params.patch_size,
                         )
                 else:
-                    results = model.forward(
-                        masked_sample, patch_size=run_params.patch_size
+                    encoded, sensor_ids, layout = model.forward(
+                        sensor_data, patch_size=run_params.patch_size
                     )
             time_taken_per_batch.append(time.monotonic() - batch_start)
 
             for callback in callbacks:
                 callback.pre_load_batch()
 
-            num_s1_tokens = calculate_num_token_embeddings(results.sentinel1)
-            num_s2_tokens = calculate_num_token_embeddings(results.sentinel2_l2a)
-            num_landsat_tokens = calculate_num_token_embeddings(results.landsat)
-            tokens_processed_per_batch.append(
-                num_s1_tokens + num_s2_tokens + num_landsat_tokens
-            )
+            # Count tokens from the layout
+            num_tokens = sum(count for _, count in layout) * batch_size
+            tokens_processed_per_batch.append(num_tokens)
+
         if device.type == "cuda":
             torch.cuda.synchronize()
         overall_time_taken = time.monotonic() - overall_start_time

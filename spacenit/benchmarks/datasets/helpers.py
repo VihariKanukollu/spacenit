@@ -8,18 +8,18 @@ from importlib.resources import files
 import torch
 from torch.utils.data import default_collate
 
-from spacenit.train.masking import MaskedSpaceNitSample
+from spacenit.structures import MaskedGeoSample
 
 
 def benchmark_collate_fn(
-    batch: Sequence[tuple[MaskedSpaceNitSample, torch.Tensor]],
-) -> tuple[MaskedSpaceNitSample, torch.Tensor]:
+    batch: Sequence[tuple[MaskedGeoSample, torch.Tensor]],
+) -> tuple[MaskedGeoSample, torch.Tensor]:
     """Collate function for DataLoaders."""
     samples, targets = zip(*batch)
     # we assume that the same values are consistently None
     collated_sample = default_collate([s.as_dict(return_none=False) for s in samples])
     collated_target = default_collate([t for t in targets])
-    return MaskedSpaceNitSample(**collated_sample), collated_target
+    return MaskedGeoSample(**collated_sample), collated_target
 
 
 @lru_cache(maxsize=1)

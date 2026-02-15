@@ -14,8 +14,8 @@ from olmo_core.train.callbacks.wandb import WANDB_API_KEY_ENV_VAR, WandBCallback
 from tqdm import tqdm
 
 from spacenit.ingestion.sensors import SensorRegistry
-from spacenit.ingestion.tile_loader import SpaceNitDataLoader
-from spacenit.ingestion.tile_dataset import SpaceNitDataset, GetItemArgs
+from spacenit.ingestion.tile_loader import GeoTileLoader
+from spacenit.ingestion.tile_dataset import GeoTileDataset, GetItemArgs
 from spacenit.ingestion.rendering import (
     plot_latlon_distribution,
     plot_modality_data_distribution,
@@ -29,7 +29,7 @@ _IMAGE_TILE_SIZE = 128
 
 
 def get_sample_data_for_histogram(
-    dataset: SpaceNitDataset, num_samples: int = 100, num_values: int = 100
+    dataset: GeoTileDataset, num_samples: int = 100, num_values: int = 100
 ) -> dict[str, Any]:
     """Get the sample data per sensor per band for showing the histogram.
 
@@ -112,7 +112,7 @@ class SpaceNitExperimentLogger(WandBCallback):
 
             self._run_path = self.run.path  # type: ignore
             if self.upload_dataset_distribution_pre_train:
-                assert isinstance(self.trainer.data_loader, SpaceNitDataLoader)
+                assert isinstance(self.trainer.data_loader, GeoTileLoader)
                 dataset = self.trainer.data_loader.dataset
                 logger.info("Gathering locations of entire dataset")
                 latlons = dataset.latlon_distribution

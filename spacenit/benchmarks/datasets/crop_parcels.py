@@ -10,8 +10,8 @@ import torch
 import torch.multiprocessing
 from torch.utils.data import Dataset
 
-from spacenit.data.constants import Sensor
-from spacenit.data.dataset import SpaceNitSample
+from spacenit.ingestion.sensors import SENTINEL2_L2A, SENTINEL1, LANDSAT, SRTM
+from spacenit.structures import GeoSample
 from spacenit.benchmarks.datasets.constants import (
     BENCH_S1_BAND_NAMES,
     BENCH_S2_BAND_NAMES,
@@ -20,7 +20,7 @@ from spacenit.benchmarks.datasets.constants import (
 )
 from spacenit.benchmarks.datasets.band_scaling import normalize_bands
 from spacenit.benchmarks.datasets.helpers import load_min_max_stats
-from spacenit.train.masking import MaskedSpaceNitSample
+from spacenit.structures import MaskedGeoSample
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,7 @@ S1_BAND_STATS = {
 class CropParcelsDataset(Dataset):
     """PASTIS-R crop parcels dataset class."""
 
-    allowed_modalities = [Sensor.SENTINEL1.label, Sensor.SENTINEL2_L2A.label]
+    allowed_modalities = [SENTINEL1.label, SENTINEL2_L2A.label]
 
     def __init__(
         self,
@@ -133,9 +133,9 @@ class CropParcelsDataset(Dataset):
         self.norm_stats_from_pretrained = norm_stats_from_pretrained
         # If normalize with pretrained stats, we initialize the normalizer here
         if self.norm_stats_from_pretrained:
-            from spacenit.data.normalize import Normalizer, Strategy
+            from spacenit.ingestion.standardizer import Standardizer, Strategy
 
-            self.normalizer_computed = Normalizer(Strategy.COMPUTED)
+            self.normalizer_computed = Standardizer(Strategy.COMPUTED)
 
         self.s2_images_dir = path_to_splits / f"pastis_r_{split}" / "s2_images"
         self.s1_images_dir = path_to_splits / f"pastis_r_{split}" / "s1_images"
@@ -172,7 +172,7 @@ class CropParcelsDataset(Dataset):
         """Length of the dataset."""
         return len(self.indices)
 
-    def __getitem__(self, idx: int) -> tuple[MaskedSpaceNitSample, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[MaskedGeoSample, torch.Tensor]:
         """Return a single crop parcels data instance."""
         image_idx = self.indices[idx]
         s2_image: np.ndarray = torch.load(
@@ -211,9 +211,9 @@ class CropParcelsDataset(Dataset):
         s1_image = s1_image[:, :, :, BENCH_TO_SPACENIT_S1_BANDS]
         if self.norm_stats_from_pretrained:
             s2_image = self.normalizer_computed.normalize(
-                Sensor.SENTINEL2_L2A, s2_image
+                SENTINEL2_L2A, s2_image
             )
-            s1_image = self.normalizer_computed.normalize(Sensor.SENTINEL1, s1_image)
+            s1_image = self.normalizer_computed.normalize(SENTINEL1, s1_image)
 
         timestamps = []
         for month in months:
@@ -228,18 +228,18 @@ class CropParcelsDataset(Dataset):
         # Build sample dict based on requested modalities
         sample_dict = {"timestamps": timestamps}
 
-        if Sensor.SENTINEL1.label in self.input_modalities:
-            sample_dict[Sensor.SENTINEL1.label] = torch.from_numpy(s1_image).float()
-        if Sensor.SENTINEL2_L2A.label in self.input_modalities:
-            sample_dict[Sensor.SENTINEL2_L2A.label] = torch.from_numpy(
+        if SENTINEL1.label in self.input_modalities:
+            sample_dict[SENTINEL1.label] = torch.from_numpy(s1_image).float()
+        if SENTINEL2_L2A.label in self.input_modalities:
+            sample_dict[SENTINEL2_L2A.label] = torch.from_numpy(
                 s2_image
             ).float()
 
         if not sample_dict:
             raise ValueError(f"No valid modalities found in: {self.input_modalities}")
 
-        masked_sample = MaskedSpaceNitSample.from_spacenitsample(
-            SpaceNitSample(**sample_dict)
+        masked_sample = MaskedGeoSample.from_spacenitsample(
+            GeoSample(**sample_dict)
         )
 
         return masked_sample, labels.long()

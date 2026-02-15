@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import NamedTuple
 
-from spacenit.data.constants import Sensor
+from spacenit.ingestion.sensors import SENTINEL2_L2A, SENTINEL1, LANDSAT
 
 
 class TaskType(Enum):
@@ -41,14 +41,14 @@ DATASET_TO_CONFIG = {
         imputes=[],
         num_classes=10,
         is_multilabel=False,
-        supported_modalities=[Sensor.SENTINEL2_L2A.label],
+        supported_modalities=[SENTINEL2_L2A.label],
     ),
     "m-bigearthnet": BenchmarkDatasetConfig(
         task_type=TaskType.CLASSIFICATION,
         imputes=[("11 - SWIR", "10 - SWIR - Cirrus")],
         num_classes=43,
         is_multilabel=True,
-        supported_modalities=[Sensor.SENTINEL2_L2A.label],
+        supported_modalities=[SENTINEL2_L2A.label],
     ),
     "m-so2sat": BenchmarkDatasetConfig(
         task_type=TaskType.CLASSIFICATION,
@@ -59,14 +59,14 @@ DATASET_TO_CONFIG = {
         ],
         num_classes=17,
         is_multilabel=False,
-        supported_modalities=[Sensor.SENTINEL2_L2A.label],
+        supported_modalities=[SENTINEL2_L2A.label],
     ),
     "m-brick-kiln": BenchmarkDatasetConfig(
         task_type=TaskType.CLASSIFICATION,
         imputes=[],
         num_classes=2,
         is_multilabel=False,
-        supported_modalities=[Sensor.SENTINEL2_L2A.label],
+        supported_modalities=[SENTINEL2_L2A.label],
     ),
     "m-sa-crop-type": BenchmarkDatasetConfig(
         task_type=TaskType.SEGMENTATION,
@@ -74,7 +74,7 @@ DATASET_TO_CONFIG = {
         num_classes=10,
         is_multilabel=False,
         height_width=256,
-        supported_modalities=[Sensor.SENTINEL2_L2A.label],
+        supported_modalities=[SENTINEL2_L2A.label],
     ),
     "m-cashew-plant": BenchmarkDatasetConfig(
         task_type=TaskType.SEGMENTATION,
@@ -82,7 +82,7 @@ DATASET_TO_CONFIG = {
         num_classes=7,
         is_multilabel=False,
         height_width=256,
-        supported_modalities=[Sensor.SENTINEL2_L2A.label],
+        supported_modalities=[SENTINEL2_L2A.label],
     ),
     "m-forestnet": BenchmarkDatasetConfig(
         task_type=TaskType.CLASSIFICATION,
@@ -94,7 +94,7 @@ DATASET_TO_CONFIG = {
         ],
         num_classes=12,
         is_multilabel=False,
-        supported_modalities=[Sensor.LANDSAT.label],
+        supported_modalities=[LANDSAT.label],
     ),
     "mados": BenchmarkDatasetConfig(
         task_type=TaskType.SEGMENTATION,
@@ -106,7 +106,7 @@ DATASET_TO_CONFIG = {
         num_classes=15,
         is_multilabel=False,
         height_width=80,
-        supported_modalities=[Sensor.SENTINEL2_L2A.label],
+        supported_modalities=[SENTINEL2_L2A.label],
     ),
     "sen1floods11": BenchmarkDatasetConfig(
         task_type=TaskType.SEGMENTATION,
@@ -114,7 +114,7 @@ DATASET_TO_CONFIG = {
         num_classes=2,
         is_multilabel=False,
         height_width=64,
-        supported_modalities=[Sensor.SENTINEL1.label],
+        supported_modalities=[SENTINEL1.label],
     ),
     "pastis": BenchmarkDatasetConfig(
         task_type=TaskType.SEGMENTATION,
@@ -122,7 +122,7 @@ DATASET_TO_CONFIG = {
         num_classes=19,
         is_multilabel=False,
         height_width=64,
-        supported_modalities=[Sensor.SENTINEL2_L2A.label, Sensor.SENTINEL1.label],
+        supported_modalities=[SENTINEL2_L2A.label, SENTINEL1.label],
         timeseries=True,
     ),
     "pastis128": BenchmarkDatasetConfig(
@@ -131,7 +131,7 @@ DATASET_TO_CONFIG = {
         num_classes=19,
         is_multilabel=False,
         height_width=128,
-        supported_modalities=[Sensor.SENTINEL2_L2A.label, Sensor.SENTINEL1.label],
+        supported_modalities=[SENTINEL2_L2A.label, SENTINEL1.label],
         timeseries=True,
     ),
     "breizhcrops": BenchmarkDatasetConfig(
@@ -140,7 +140,7 @@ DATASET_TO_CONFIG = {
         num_classes=9,
         is_multilabel=False,
         height_width=1,
-        supported_modalities=[Sensor.SENTINEL2_L2A.label],
+        supported_modalities=[SENTINEL2_L2A.label],
         timeseries=True,
     ),
     "nandi": BenchmarkDatasetConfig(
@@ -149,9 +149,9 @@ DATASET_TO_CONFIG = {
         num_classes=6,
         is_multilabel=False,
         supported_modalities=[
-            Sensor.SENTINEL2_L2A.label,
-            Sensor.SENTINEL1.label,
-            Sensor.LANDSAT.label,
+            SENTINEL2_L2A.label,
+            SENTINEL1.label,
+            LANDSAT.label,
         ],
         timeseries=True,
     ),
@@ -161,9 +161,9 @@ DATASET_TO_CONFIG = {
         num_classes=9,
         is_multilabel=False,
         supported_modalities=[
-            Sensor.SENTINEL2_L2A.label,
-            Sensor.SENTINEL1.label,
-            Sensor.LANDSAT.label,
+            SENTINEL2_L2A.label,
+            SENTINEL1.label,
+            LANDSAT.label,
         ],
         timeseries=True,
     ),

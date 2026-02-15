@@ -9,11 +9,8 @@ import torch
 from einops import repeat
 from torch.utils.data import ConcatDataset, Dataset
 
-from spacenit.train.masking import (
-    MaskedSpaceNitSample,
-    Sensor,
-    SpaceNitSample,
-)
+from spacenit.ingestion.sensors import SENTINEL2_L2A, SensorSpec
+from spacenit.structures import GeoSample, MaskedGeoSample
 
 from .constants import BENCH_S2_BAND_NAMES, BENCH_TO_SPACENIT_S2_BANDS
 from .band_scaling import normalize_bands
@@ -136,9 +133,9 @@ class CropTimeseriesDataset(Dataset):
         self.norm_method = norm_method
         # If normalize with pretrained stats, we initialize the normalizer here
         if self.norm_stats_from_pretrained:
-            from spacenit.data.normalize import Normalizer, Strategy
+            from spacenit.ingestion.standardizer import Standardizer, Strategy
 
-            self.normalizer_computed = Normalizer(Strategy.COMPUTED)
+            self.normalizer_computed = Standardizer(Strategy.COMPUTED)
 
     @staticmethod
     def _get_norm_stats(
@@ -160,7 +157,7 @@ class CropTimeseriesDataset(Dataset):
         """Length of the dataset."""
         return len(self.ds)
 
-    def __getitem__(self, idx: int) -> tuple[MaskedSpaceNitSample, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[MaskedGeoSample, torch.Tensor]:
         """Return a crop timeseries instance."""
         x, y_true, _ = self.ds[idx]
         if self.monthly_average:
@@ -184,10 +181,10 @@ class CropTimeseriesDataset(Dataset):
             self.input_to_output_band_mapping,
         ][:, :, :, BENCH_TO_SPACENIT_S2_BANDS]
         if self.norm_stats_from_pretrained:
-            image = self.normalizer_computed.normalize(Sensor.SENTINEL2_L2A, image)
+            image = self.normalizer_computed.normalize(SENTINEL2_L2A, image)
 
-        masked_sample = MaskedSpaceNitSample.from_spacenitsample(
-            SpaceNitSample(
+        masked_sample = MaskedGeoSample.from_spacenitsample(
+            GeoSample(
                 sentinel2_l2a=torch.tensor(image).float(), timestamps=timestamp.long()
             )
         )

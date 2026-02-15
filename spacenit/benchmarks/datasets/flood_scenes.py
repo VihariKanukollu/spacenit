@@ -11,9 +11,9 @@ from einops import rearrange, repeat
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from spacenit.data.constants import Sensor
-from spacenit.data.dataset import SpaceNitSample
-from spacenit.train.masking import MaskedSpaceNitSample
+from spacenit.ingestion.sensors import SENTINEL2_L2A, SENTINEL1, LANDSAT, SRTM
+from spacenit.structures import GeoSample
+from spacenit.structures import MaskedGeoSample
 
 from .constants import BENCH_S1_BAND_NAMES, BENCH_TO_SPACENIT_S1_BANDS
 from .band_scaling import normalize_bands
@@ -231,9 +231,9 @@ class FloodScenesDataset(Dataset):
         self.norm_method = norm_method
         # If normalize with pretrained stats, we initialize the normalizer here
         if self.norm_stats_from_pretrained:
-            from spacenit.data.normalize import Normalizer, Strategy
+            from spacenit.ingestion.standardizer import Standardizer, Strategy
 
-            self.normalizer_computed = Normalizer(Strategy.COMPUTED)
+            self.normalizer_computed = Standardizer(Strategy.COMPUTED)
 
         if mode != "s1":
             raise ValueError(f"Modes other than s1 not yet supported, got {mode}")
@@ -271,7 +271,7 @@ class FloodScenesDataset(Dataset):
         """Length of eval set."""
         return self.s1.shape[0]
 
-    def __getitem__(self, idx: int) -> tuple[MaskedSpaceNitSample, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[MaskedGeoSample, torch.Tensor]:
         """Return an instance of the flood scenes benchmark dataset."""
         image = self.s1[idx]  # (64, 64, 2)
         label = self.labels[idx][0]  # (64, 64)
@@ -292,11 +292,11 @@ class FloodScenesDataset(Dataset):
             BENCH_TO_SPACENIT_S1_BANDS,
         ]
         if self.norm_stats_from_pretrained:
-            image = self.normalizer_computed.normalize(Sensor.SENTINEL1, image)
+            image = self.normalizer_computed.normalize(SENTINEL1, image)
 
         timestamp = repeat(torch.tensor(self.default_day_month_year), "d -> t d", t=1)
-        masked_sample = MaskedSpaceNitSample.from_spacenitsample(
-            SpaceNitSample(
+        masked_sample = MaskedGeoSample.from_spacenitsample(
+            GeoSample(
                 sentinel1=torch.tensor(image).float(), timestamps=timestamp.long()
             )
         )

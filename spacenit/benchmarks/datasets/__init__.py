@@ -1,19 +1,18 @@
-"""SpaceNit benchmark datasets."""
+"""SpaceNit benchmark datasets.
+
+Dataset classes are imported lazily inside :func:`get_benchmark_dataset`
+to avoid pulling in heavy optional dependencies (rioxarray, etc.) at
+package-import time.
+"""
+
+from __future__ import annotations
 
 import logging
 
 from olmo_core.config import StrEnum
 from torch.utils.data import Dataset
 
-import spacenit.benchmarks.datasets.storage as storage
-
-from .crop_timeseries import CropTimeseriesDataset
-from .flood_scenes import FloodScenesDataset
-from .geo_benchmark import GeoBenchmarkDataset
-from .marine_debris import MarineDebrisDataset
 from .band_scaling import NormMethod
-from .crop_parcels import CropParcelsDataset
-from .rslearn_adapter import RslearnToSpaceNitDataset
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +21,7 @@ class BenchmarkDatasetPartition(StrEnum):
     """Enum for different dataset partitions."""
 
     TRAIN1X = "default"
-    TRAIN_001X = "0.01x_train"  # Not valid for non train split
+    TRAIN_001X = "0.01x_train"
     TRAIN_002X = "0.02x_train"
     TRAIN_005X = "0.05x_train"
     TRAIN_010X = "0.10x_train"
@@ -34,12 +33,23 @@ def get_benchmark_dataset(
     benchmark_dataset: str,
     split: str,
     norm_stats_from_pretrained: bool = False,
-    input_modalities: list[str] = [],
-    input_layers: list[str] = [],
+    input_modalities: list[str] | None = None,
+    input_layers: list[str] | None = None,
     partition: str = BenchmarkDatasetPartition.TRAIN1X,
     norm_method: str = NormMethod.NORM_NO_CLIP,
 ) -> Dataset:
-    """Retrieve a benchmark dataset from the dataset name."""
+    """Retrieve a benchmark dataset from the dataset name.
+
+    Dataset classes are imported lazily to avoid pulling in heavy
+    optional dependencies at package-import time.
+    """
+    import spacenit.benchmarks.datasets.storage as storage
+
+    if input_modalities is None:
+        input_modalities = []
+    if input_layers is None:
+        input_layers = []
+
     if input_modalities:
         if benchmark_dataset not in ["pastis", "pastis128", "nandi", "awf"]:
             raise ValueError(
@@ -53,7 +63,8 @@ def get_benchmark_dataset(
             )
 
     if benchmark_dataset.startswith("m-"):
-        # m- == "modified for geobench"
+        from .geo_benchmark import GeoBenchmarkDataset
+
         return GeoBenchmarkDataset(
             geobench_dir=storage.GEOBENCH_DIR,
             dataset=benchmark_dataset,
@@ -63,6 +74,8 @@ def get_benchmark_dataset(
             norm_method=norm_method,
         )
     elif benchmark_dataset == "mados":
+        from .marine_debris import MarineDebrisDataset
+
         if norm_stats_from_pretrained:
             logger.warning(
                 "MADOS has very different norm stats than our pretraining dataset"
@@ -75,6 +88,8 @@ def get_benchmark_dataset(
             norm_method=norm_method,
         )
     elif benchmark_dataset == "sen1floods11":
+        from .flood_scenes import FloodScenesDataset
+
         return FloodScenesDataset(
             path_to_splits=storage.FLOODS_DIR,
             split=split,
@@ -83,6 +98,8 @@ def get_benchmark_dataset(
             norm_method=norm_method,
         )
     elif benchmark_dataset.startswith("pastis"):
+        from .crop_parcels import CropParcelsDataset
+
         kwargs = {
             "split": split,
             "partition": partition,
@@ -92,12 +109,13 @@ def get_benchmark_dataset(
             "dir_partition": storage.PASTIS_DIR_PARTITION,
         }
         if "128" in benchmark_dataset:
-            # "pastis128"
             kwargs["path_to_splits"] = storage.PASTIS_DIR_ORIG
         else:
             kwargs["path_to_splits"] = storage.PASTIS_DIR
         return CropParcelsDataset(**kwargs)  # type: ignore
     elif benchmark_dataset == "breizhcrops":
+        from .crop_timeseries import CropTimeseriesDataset
+
         return CropTimeseriesDataset(
             path_to_splits=storage.BREIZHCROPS_DIR,
             split=split,
@@ -106,6 +124,8 @@ def get_benchmark_dataset(
             norm_method=norm_method,
         )
     elif benchmark_dataset == "nandi":
+        from .rslearn_adapter import RslearnToSpaceNitDataset
+
         return RslearnToSpaceNitDataset(
             ds_path=storage.NANDI_DIR,
             ds_groups=["groundtruth_polygon_split_window_32"],
@@ -123,6 +143,8 @@ def get_benchmark_dataset(
             ds_norm_stats_json="nandi_band_stats.json",
         )
     elif benchmark_dataset == "awf":
+        from .rslearn_adapter import RslearnToSpaceNitDataset
+
         return RslearnToSpaceNitDataset(
             ds_path=storage.AWF_DIR,
             ds_groups=["20250822"],

@@ -1,6 +1,6 @@
 """Useful constants for benchmarks."""
 
-from spacenit.data.constants import Sensor
+from spacenit.ingestion.sensors import SENTINEL2_L2A, SENTINEL1, LANDSAT
 
 BENCH_S2_BAND_NAMES = [
     "01 - Coastal aerosol",
@@ -68,20 +68,20 @@ def _bench_l8_band_index_from_spacenit_name(spacenit_name: str) -> int:
 
 BENCH_TO_SPACENIT_S2_BANDS = [
     _bench_s2_band_index_from_spacenit_name(b, BENCH_S2_BAND_NAMES)
-    for b in Sensor.SENTINEL2_L2A.all_channel_names
+    for b in SENTINEL2_L2A.all_channel_names
 ]
 
 BENCH_TO_SPACENIT_S2_L2A_BANDS = [
     _bench_s2_band_index_from_spacenit_name(b, BENCH_S2_L2A_BAND_NAMES)
-    for b in Sensor.SENTINEL2_L2A.all_channel_names
+    for b in SENTINEL2_L2A.all_channel_names
 ]
 
 BENCH_TO_SPACENIT_S1_BANDS = [
-    _bench_s1_band_index_from_spacenit_name(b) for b in Sensor.SENTINEL1.all_channel_names
+    _bench_s1_band_index_from_spacenit_name(b) for b in SENTINEL1.all_channel_names
 ]
 
 BENCH_TO_SPACENIT_L8_BANDS = [
-    _bench_l8_band_index_from_spacenit_name(b) for b in Sensor.LANDSAT.all_channel_names
+    _bench_l8_band_index_from_spacenit_name(b) for b in LANDSAT.all_channel_names
 ]
 
 # one to one mapping

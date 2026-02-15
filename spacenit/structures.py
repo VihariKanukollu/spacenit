@@ -145,6 +145,20 @@ class GeoSample:
             result[key] = self._data.get(key)
         return result
 
+    def as_dict(self, return_none: bool = True) -> dict[str, NdTensor | None]:
+        """Alias for :meth:`to_dict` with inverted flag semantics.
+
+        Args:
+            return_none: When ``True``, include ``None`` entries for missing
+                fields.  When ``False``, only populated fields are returned.
+        """
+        return self.to_dict(ignore_nones=not return_none)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> GeoSample:
+        """Construct a :class:`GeoSample` from a plain dictionary."""
+        return cls(**{k: v for k, v in d.items() if v is not None})
+
     # -- sensor queries -------------------------------------------------------
 
     @property
@@ -667,6 +681,55 @@ class MaskedGeoSample:
             result["latlon"] = self._data["latlon"]
             result["latlon_mask"] = self._masks.get("latlon_mask")
         return result
+
+    def as_dict(self, return_none: bool = True) -> dict[str, Any]:
+        """Alias for :meth:`to_dict` with the same semantics.
+
+        Args:
+            return_none: When ``True``, include ``None`` entries for missing
+                fields.  When ``False``, only populated fields are returned.
+        """
+        return self.to_dict(return_none=return_none)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> MaskedGeoSample:
+        """Construct a :class:`MaskedGeoSample` from a plain dictionary."""
+        return cls(**{k: v for k, v in d.items() if v is not None})
+
+    @classmethod
+    def from_geosample(cls, sample: GeoSample) -> MaskedGeoSample:
+        """Wrap a :class:`GeoSample` in a :class:`MaskedGeoSample`.
+
+        For each sensor present in *sample*, a mask is created with all
+        tokens set to :attr:`TokenVisibility.VISIBLE_ENCODER`.  Absent
+        sensors are not included.
+        """
+        kwargs: dict[str, Any] = {}
+        for key in sample._fields:
+            val = sample[key]
+            if val is None:
+                continue
+            kwargs[key] = val
+            # Add a mask for non-meta fields
+            if key not in _META_FIELDS:
+                if isinstance(val, torch.Tensor):
+                    kwargs[f"{key}_mask"] = torch.full_like(
+                        val[..., 0:1].squeeze(-1) if val.ndim > 1 else val,
+                        TokenVisibility.VISIBLE_ENCODER.value,
+                        dtype=torch.long,
+                    )
+                else:
+                    import numpy as _np
+
+                    kwargs[f"{key}_mask"] = _np.full_like(
+                        val[..., 0:1].squeeze(-1) if val.ndim > 1 else val,
+                        TokenVisibility.VISIBLE_ENCODER.value,
+                        dtype=_np.int64,
+                    )
+        return cls(**kwargs)
+
+    # Alias for backward compatibility with benchmark code that uses the old name.
+    from_spacenitsample = from_geosample
 
     # -- sensor queries -------------------------------------------------------
 

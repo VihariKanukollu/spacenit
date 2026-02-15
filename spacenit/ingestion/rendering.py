@@ -9,6 +9,7 @@ import cartopy.feature as cfeature
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
+import numpy as np
 from einops import rearrange
 from matplotlib.figure import Figure
 from upath import UPath
@@ -18,6 +19,48 @@ from spacenit.ingestion.sensors import SensorRegistry
 from spacenit.ingestion.tile_dataset import GeoTileDataset, GetItemArgs
 
 logger = logging.getLogger(__name__)
+
+
+def plot_latlon_distribution(latlons: np.ndarray, title: str) -> Figure:
+    """Plot the geographic distribution of the data on a world map."""
+    fig = plt.figure(figsize=(12, 8))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+
+    ax.add_feature(cfeature.COASTLINE)
+    ax.add_feature(cfeature.LAND, alpha=0.1)
+    ax.add_feature(cfeature.OCEAN, alpha=0.1)
+
+    ax.scatter(
+        latlons[:, 1],
+        latlons[:, 0],
+        transform=ccrs.PlateCarree(),
+        alpha=0.5,
+        s=0.01,
+    )
+
+    ax.set_global()
+    ax.gridlines()
+    ax.set_title(title)
+    return fig
+
+
+def plot_modality_data_distribution(
+    modality: str, modality_data: dict[str, list[float]]
+) -> Figure:
+    """Plot per-band histograms for a single modality."""
+    fig, axes = plt.subplots(
+        len(modality_data), 1, figsize=(10, 5 * len(modality_data))
+    )
+    if len(modality_data) == 1:
+        axes = [axes]
+    for ax, (band, values) in zip(axes, modality_data.items()):
+        ax.hist(values, bins=50, alpha=0.75)
+        ax.set_title(f"{modality} - {band}")
+        ax.set_xlabel("Value")
+        ax.set_ylabel("Frequency")
+        ax.grid(True, linestyle="--", alpha=0.5)
+    fig.tight_layout()
+    return fig
 
 WORLDCOVER_LEGEND = {
     10: ("#006400", "Tree cover"),

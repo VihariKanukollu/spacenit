@@ -27,6 +27,7 @@ from torch import Tensor
 from spacenit.arch.attention import RMSNorm, TransformerBlock, TransformerStack
 from spacenit.arch.encoder import Decoder, Encoder, EncoderConfig
 from spacenit.arch.heads import PixelHead, PoolingHead, ProjectionHead
+from spacenit.settings import Config
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +55,7 @@ def _ema_update(
 
 
 @dataclass
-class LatentPredictorConfig:
+class LatentPredictorConfig(Config):
     """Configuration for :class:`LatentPredictor`."""
 
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
@@ -65,6 +66,10 @@ class LatentPredictorConfig:
     ema_momentum_end: float = 1.0
     ema_warmup_steps: int = 10000
     projection_dim: int = 256
+
+    def build(self) -> LatentPredictor:
+        """Build a :class:`LatentPredictor` from this configuration."""
+        return LatentPredictor(self)
 
 
 class LatentPredictor(nn.Module):
@@ -212,7 +217,7 @@ class LatentPredictor(nn.Module):
 
 
 @dataclass
-class AutoEncoderConfig:
+class AutoEncoderConfig(Config):
     """Configuration for :class:`AutoEncoder`."""
 
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
@@ -220,6 +225,10 @@ class AutoEncoderConfig:
     decoder_num_heads: int = 12
     decoder_num_kv_heads: int | None = None
     out_channels: int = 13  # e.g. Sentinel-2 bands
+
+    def build(self) -> AutoEncoder:
+        """Build an :class:`AutoEncoder` from this configuration."""
+        return AutoEncoder(self)
 
 
 class AutoEncoder(nn.Module):
@@ -289,7 +298,7 @@ class AutoEncoder(nn.Module):
 
 
 @dataclass
-class DualBranchConfig:
+class DualBranchConfig(Config):
     """Configuration for :class:`DualBranch`."""
 
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
@@ -301,6 +310,10 @@ class DualBranchConfig:
     ema_warmup_steps: int = 10000
     projection_dim: int = 256
     out_channels: int = 13
+
+    def build(self) -> DualBranch:
+        """Build a :class:`DualBranch` from this configuration."""
+        return DualBranch(self)
 
 
 class DualBranch(nn.Module):
@@ -511,12 +524,16 @@ class AxialAttentionBlock(nn.Module):
 
 
 @dataclass
-class SpatioTemporalConfig:
+class SpatioTemporalConfig(Config):
     """Configuration for :class:`SpatioTemporalEncoder`."""
 
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
     axial_depth: int = 6
     projection_dim: int = 256
+
+    def build(self) -> SpatioTemporalEncoder:
+        """Build a :class:`SpatioTemporalEncoder` from this configuration."""
+        return SpatioTemporalEncoder(self)
 
 
 class SpatioTemporalEncoder(nn.Module):

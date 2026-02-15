@@ -5,9 +5,9 @@ import logging
 import torch
 from torch.utils.data import DataLoader
 
-from spacenit.benchmarks.feature_transforms import quantize_features
 from spacenit.benchmarks.benchmark_adapter import BenchmarkAdapter
-from spacenit.train.masking import MaskedSpaceNitSample
+from spacenit.benchmarks.feature_transforms import quantize_features
+from spacenit.structures import MaskedGeoSample
 
 logger = logging.getLogger(__name__)
 
@@ -35,24 +35,18 @@ def get_features(
     device = model.device
     total_samples = len(data_loader)
     with torch.no_grad():
-        for i, (masked_spacenit_sample, label) in enumerate(data_loader):
-            masked_spacenit_sample_dict = masked_spacenit_sample.as_dict(
-                return_none=False
-            )
-            for key, val in masked_spacenit_sample_dict.items():
+        for i, (sample, label) in enumerate(data_loader):
+            sample_dict = sample.as_dict(return_none=False)
+            for key, val in sample_dict.items():
                 if key == "timestamps":
-                    masked_spacenit_sample_dict[key] = val.to(device=device)
+                    sample_dict[key] = val.to(device=device)
                 else:
-                    masked_spacenit_sample_dict[key] = val.to(
-                        device=device,
-                    )
+                    sample_dict[key] = val.to(device=device)
 
-            masked_spacenit_sample = MaskedSpaceNitSample.from_dict(
-                masked_spacenit_sample_dict
-            )
+            sample = MaskedGeoSample.from_dict(sample_dict)
             with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
                 batch_features, label = model(
-                    masked_spacenit_sample=masked_spacenit_sample,
+                    sample=sample,
                     labels=label,
                     is_train=is_train,
                 )
@@ -64,7 +58,6 @@ def get_features(
     features = torch.cat(features_list, dim=0)  # (N, dim)
     labels = torch.cat(labels_list, dim=0)  # (N)
 
-    # Apply quantization if requested
     if quantize:
         logger.info(f"Quantizing features from {features.dtype} to int8")
         features = quantize_features(features)

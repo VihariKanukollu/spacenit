@@ -13,9 +13,9 @@ from geobench.dataset import Stats
 from geobench.task import load_task_specs
 from torch.utils.data import Dataset
 
-from spacenit.data.constants import Sensor
-from spacenit.data.dataset import SpaceNitSample
-from spacenit.train.masking import MaskedSpaceNitSample
+from spacenit.ingestion.sensors import SENTINEL2_L2A, SENTINEL1, LANDSAT, SRTM
+from spacenit.structures import GeoSample
+from spacenit.structures import MaskedGeoSample
 
 from .registry import dataset_to_config
 from .constants import (
@@ -99,9 +99,9 @@ class GeoBenchmarkDataset(Dataset):
         self.norm_stats_from_pretrained = norm_stats_from_pretrained
         # If normalize with pretrained stats, we initialize the normalizer here
         if self.norm_stats_from_pretrained:
-            from spacenit.data.normalize import Normalizer, Strategy
+            from spacenit.ingestion.standardizer import Standardizer, Strategy
 
-            self.normalizer_computed = Normalizer(Strategy.COMPUTED)
+            self.normalizer_computed = Standardizer(Strategy.COMPUTED)
         # GEOBENCH cannot handle remote upath objects
         dataset_dir = geobench_dir / f"{config.task_type.value}_v1.0" / dataset
         task = load_task_specs(dataset_dir)  # Note: Cannot handle remote paths
@@ -127,7 +127,7 @@ class GeoBenchmarkDataset(Dataset):
         self.original_band_indices_after_imputation: list[int] = []
         if self.is_landsat:
             band_order_in_geobench_names = [
-                _landsat_spacenit2geobench_name(b) for b in Sensor.LANDSAT.all_channel_names
+                _landsat_spacenit2geobench_name(b) for b in LANDSAT.all_channel_names
             ]
             self.original_band_indices_after_imputation = [
                 band_order_in_geobench_names.index(b) for b in original_band_names
@@ -204,7 +204,7 @@ class GeoBenchmarkDataset(Dataset):
                         break
         return new_image_list
 
-    def __getitem__(self, idx: int) -> tuple[MaskedSpaceNitSample, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[MaskedGeoSample, torch.Tensor]:
         """Return a single GeoBench data instance."""
         sample = self.dataset[idx]
         label = sample.label
@@ -256,7 +256,7 @@ class GeoBenchmarkDataset(Dataset):
             ]
             # Normalize using the pretrained dataset's normalization stats
             if self.norm_stats_from_pretrained:
-                landsat = self.normalizer_computed.normalize(Sensor.LANDSAT, landsat)
+                landsat = self.normalizer_computed.normalize(LANDSAT, landsat)
                 # For Landsat (ForestNet), only 5/11 bands are present, and the rest
                 # are imputed. This means some of the means and standard deviations
                 # from the pretrained stats are very different. To handle this, we
@@ -286,12 +286,12 @@ class GeoBenchmarkDataset(Dataset):
             ]
             # Normalize using the pretrained dataset's normalization stats
             if self.norm_stats_from_pretrained:
-                s2 = self.normalizer_computed.normalize(Sensor.SENTINEL2_L2A, s2)
+                s2 = self.normalizer_computed.normalize(SENTINEL2_L2A, s2)
             sample_dict["sentinel2_l2a"] = torch.tensor(s2).float()
 
         timestamp = repeat(torch.tensor(self.default_day_month_year), "d -> t d", t=1)
-        masked_sample = MaskedSpaceNitSample.from_spacenitsample(
-            SpaceNitSample(**sample_dict, timestamps=timestamp.long())
+        masked_sample = MaskedGeoSample.from_spacenitsample(
+            GeoSample(**sample_dict, timestamps=timestamp.long())
         )
         return masked_sample, target
 

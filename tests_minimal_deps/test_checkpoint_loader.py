@@ -35,9 +35,8 @@ from spacenit.checkpoint_loader import (
     load_from_directory,
     load_pretrained,
 )
-from spacenit.arch.adaptive_vision_encoder import VisionEncoderConfig
-from spacenit.arch.adaptive_vision_encoder import LatentPredictorConfig
-from spacenit.arch.latent_masked_prediction import LatentMaskedPredictorConfig
+from spacenit.arch.encoder import EncoderConfig
+from spacenit.arch.models import LatentPredictorConfig
 
 # =============================================================================
 # Test Helpers
@@ -46,28 +45,16 @@ from spacenit.arch.latent_masked_prediction import LatentMaskedPredictorConfig
 
 def _create_minimal_model_config() -> dict:
     """Create a minimal model config that can be built."""
-    encoder_config = VisionEncoderConfig(
-        supported_sensor_labels=["sentinel2_l2a", "sentinel1"],
-        embed_dim=16,
-        tile_patch_size=8,
-        head_count=2,
-        depth=2,
-        ffn_expansion=4.0,
-        stochastic_depth_rate=0.1,
-        max_sequence_length=12,
-    )
-    decoder_config = LatentPredictorConfig(
-        encoder_embed_dim=16,
-        decoder_embed_dim=16,
-        depth=2,
-        ffn_expansion=4.0,
-        head_count=8,
-        max_sequence_length=12,
-        supported_sensor_labels=["sentinel2_l2a", "sentinel1"],
-    )
-    model_config = LatentMaskedPredictorConfig(
-        encoder_cfg=encoder_config,
-        decoder_cfg=decoder_config,
+    model_config = LatentPredictorConfig(
+        encoder=EncoderConfig(
+            sensor_labels=["sentinel2_l2a", "sentinel1"],
+            embed_dim=16,
+            num_heads=2,
+            depth=2,
+            ffn_expansion=4.0,
+        ),
+        decoder_depth=2,
+        decoder_num_heads=2,
     )
     # Return the structure expected by checkpoint_loader: {"model": <config_dict>}
     return {"model": model_config.as_config_dict()}
@@ -85,15 +72,14 @@ def _create_minimal_state_dict() -> dict[str, torch.Tensor]:
 
 @pytest.fixture
 def encoder_config_dict() -> dict:
-    """Create a minimal VisionEncoderConfig as a dict."""
+    """Create a minimal EncoderConfig as a dict."""
     return {
-        "_CLASS_": "spacenit.arch.adaptive_vision_encoder.VisionEncoderConfig",
-        "supported_sensor_labels": ["sentinel2_l2a"],
+        "_CLASS_": "spacenit.arch.encoder.EncoderConfig",
+        "sensor_labels": ["sentinel2_l2a"],
         "embed_dim": 64,
-        "head_count": 2,
+        "num_heads": 2,
         "depth": 2,
         "ffn_expansion": 4.0,
-        "max_sequence_length": 64,
     }
 
 
@@ -138,26 +124,26 @@ class TestConfigExport:
 
 
 # =============================================================================
-# VisionEncoderConfig Loading Tests
+# EncoderConfig Loading Tests
 # =============================================================================
 
 
-class TestVisionEncoderConfigLoading:
-    """Tests for loading VisionEncoderConfig using the exported Config."""
+class TestEncoderConfigLoading:
+    """Tests for loading EncoderConfig using the exported Config."""
 
     def test_load_encoder_config_from_dict(self, encoder_config_dict: dict) -> None:
-        """Test loading VisionEncoderConfig from a dict."""
-        config = VisionEncoderConfig.from_dict(encoder_config_dict)
+        """Test loading EncoderConfig from a dict."""
+        config = EncoderConfig.from_dict(encoder_config_dict)
 
-        assert isinstance(config, VisionEncoderConfig)
+        assert isinstance(config, EncoderConfig)
         assert config.embed_dim == 64
-        assert config.head_count == 2
+        assert config.num_heads == 2
         assert config.depth == 2
-        assert config.supported_sensor_labels == ["sentinel2_l2a"]
+        assert config.sensor_labels == ["sentinel2_l2a"]
 
     def test_build_encoder_from_config(self, encoder_config_dict: dict) -> None:
         """Test building an Encoder from the loaded config."""
-        config = VisionEncoderConfig.from_dict(encoder_config_dict)
+        config = EncoderConfig.from_dict(encoder_config_dict)
         encoder = config.build()
 
         assert encoder is not None

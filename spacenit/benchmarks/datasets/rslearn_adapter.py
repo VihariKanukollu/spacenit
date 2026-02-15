@@ -21,19 +21,19 @@ from rslearn.train.transforms.pad import Pad as RsPad
 from torch.utils.data import Dataset
 from upath import UPath
 
-from spacenit.data.constants import YEAR_NUM_TIMESTEPS
-from spacenit.data.constants import Sensor as DataModality
-from spacenit.data.utils import convert_to_db
-from spacenit.train.masking import MaskedSpaceNitSample, SpaceNitSample
+YEAR_NUM_TIMESTEPS = 12
+from spacenit.ingestion.sensors import SensorSpec as DataModality, SENTINEL1, SENTINEL2_L2A
+from spacenit.ingestion.helpers import convert_to_db
+from spacenit.structures import GeoSample, MaskedGeoSample
 
 from .band_scaling import normalize_bands
 
 # rslearn layer name -> (spacenit modality name, all bands)
 RSLEARN_TO_SPACENIT: dict[str, tuple[str, list[str]]] = {
-    "sentinel2": ("sentinel2_l2a", DataModality.SENTINEL2_L2A.all_channel_names),
-    "sentinel1": ("sentinel1", DataModality.SENTINEL1.all_channel_names),
-    "sentinel1_ascending": ("sentinel1", DataModality.SENTINEL1.all_channel_names),
-    "sentinel1_descending": ("sentinel1", DataModality.SENTINEL1.all_channel_names),
+    "sentinel2": ("sentinel2_l2a", SENTINEL2_L2A.all_channel_names),
+    "sentinel1": ("sentinel1", SENTINEL1.all_channel_names),
+    "sentinel1_ascending": ("sentinel1", SENTINEL1.all_channel_names),
+    "sentinel1_descending": ("sentinel1", SENTINEL1.all_channel_names),
     "landsat": ("landsat", DataModality.LANDSAT.all_channel_names),
 }
 
@@ -172,11 +172,11 @@ def get_timestamps(
 
 
 class RslearnToSpaceNitDataset(Dataset):
-    """Convert rslearn ModelDataset to SpaceNit MaskedSpaceNitSample dataset.
+    """Convert rslearn ModelDataset to SpaceNit MaskedGeoSample dataset.
 
     Expects rslearn ModelDataset to yield: (inputs_dict, target, metadata).
     inputs_dict[<modality>] shape: (T*C, H, W) after rslearn transforms.
-    We reshape to (H, W, T, C), normalize, attach timestamps, and wrap as SpaceNitSample.
+    We reshape to (H, W, T, C), normalize, attach timestamps, and wrap as GeoSample.
     """
 
     allowed_modalities = {
@@ -234,9 +234,9 @@ class RslearnToSpaceNitDataset(Dataset):
         self.timestamps = torch.stack(get_timestamps(start_time, end_time))  # (T, 3)
 
         if self.norm_stats_from_pretrained:
-            from spacenit.data.normalize import Normalizer, Strategy
+            from spacenit.ingestion.standardizer import Standardizer, Strategy
 
-            self.normalizer_computed = Normalizer(Strategy.COMPUTED)
+            self.normalizer_computed = Standardizer(Strategy.COMPUTED)
         else:
             self.dataset_norm_stats = self._get_norm_stats(ds_norm_stats_json)  # type: ignore
             self.norm_method = norm_method
@@ -279,8 +279,8 @@ class RslearnToSpaceNitDataset(Dataset):
         """Length of the dataset."""
         return len(self.dataset)
 
-    def __getitem__(self, idx: int) -> tuple[MaskedSpaceNitSample, torch.Tensor]:
-        """Return a MaskedSpaceNitSample and target tensor."""
+    def __getitem__(self, idx: int) -> tuple[MaskedGeoSample, torch.Tensor]:
+        """Return a MaskedGeoSample and target tensor."""
         input_dict, target, _ = self.dataset[idx]
 
         sample_dict: dict[str, Any] = {}
@@ -320,6 +320,6 @@ class RslearnToSpaceNitDataset(Dataset):
 
         sample_dict["timestamps"] = self.timestamps
 
-        spacenit_sample = SpaceNitSample(**sample_dict)
-        masked_sample = MaskedSpaceNitSample.from_spacenitsample(spacenit_sample)
+        spacenit_sample = GeoSample(**sample_dict)
+        masked_sample = MaskedGeoSample.from_spacenitsample(spacenit_sample)
         return masked_sample, target["class"].long()

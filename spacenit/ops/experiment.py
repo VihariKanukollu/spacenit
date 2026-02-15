@@ -18,11 +18,10 @@ from olmo_core.train import (
 from olmo_core.train.callbacks import ConfigSaverCallback, WandBCallback
 from olmo_core.utils import get_default_device, prepare_cli_environment, seed_all
 
-from spacenit.annotations import deprecated_class_alias as _deprecated_class_alias
 from spacenit.settings import Config
 from spacenit.ingestion.sensors import SensorRegistry
-from spacenit.ingestion.tile_dataset import SpaceNitDataLoaderConfig
-from spacenit.ingestion.merged_dataset import SpaceNitDatasetConfig
+from spacenit.ingestion.tile_loader import GeoTileLoaderConfig
+from spacenit.ingestion.merged_dataset import GeoTileMergedDatasetConfig
 from spacenit.ingestion.rendering import visualize_sample
 from spacenit.profiling.throughput_runner import ThroughputBenchmarkRunnerConfig
 from spacenit.ops.helpers import (
@@ -30,7 +29,7 @@ from spacenit.ops.helpers import (
     MockSpaceNitDataLoader,
 )
 from spacenit.arch.band_tokenization import TokenizationConfig
-from spacenit.pipeline.runners import SpaceNitTrainModuleConfig
+from spacenit.pipeline.runners import SpaceNitTrainRunnerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +106,8 @@ class SpaceNitExperimentConfig(Config):
     run_name: str
     model: Config
     dataset: Config
-    data_loader: SpaceNitDataLoaderConfig
-    train_module: SpaceNitTrainModuleConfig
+    data_loader: GeoTileLoaderConfig
+    train_module: SpaceNitTrainRunnerConfig
     trainer: TrainerConfig
     launch: SpaceNitBeakerLaunchConfig | None = None
     visualize: SpaceNitVisualizeConfig | None = None
@@ -123,7 +122,7 @@ class SpaceNitEvaluateConfig(Config):
     model: Config
     trainer: TrainerConfig
     launch: SpaceNitBeakerLaunchConfig | None = None
-    train_module: SpaceNitTrainModuleConfig | None = None
+    train_module: SpaceNitTrainRunnerConfig | None = None
     init_seed: int = 12536
 
 
@@ -152,12 +151,12 @@ def split_common_overrides(overrides: list[str]) -> tuple[list[str], list[str]]:
 def build_config(
     common: CommonComponents,
     model_config_builder: Callable[[CommonComponents], Config],
-    dataset_config_builder: Callable[[CommonComponents], SpaceNitDatasetConfig],
-    dataloader_config_builder: Callable[[CommonComponents], SpaceNitDataLoaderConfig],
+    dataset_config_builder: Callable[[CommonComponents], GeoTileMergedDatasetConfig],
+    dataloader_config_builder: Callable[[CommonComponents], GeoTileLoaderConfig],
     trainer_config_builder: Callable[[CommonComponents], TrainerConfig],
     train_module_config_builder: Callable[
         [CommonComponents],
-        SpaceNitTrainModuleConfig,
+        SpaceNitTrainRunnerConfig,
     ],
     overrides: list[str],
     visualize_config_builder: (
@@ -198,7 +197,7 @@ def build_evaluate_config(
     trainer_config_builder: Callable[[CommonComponents], TrainerConfig],
     overrides: list[str],
     train_module_config_builder: (
-        Callable[[CommonComponents], SpaceNitTrainModuleConfig] | None
+        Callable[[CommonComponents], SpaceNitTrainRunnerConfig] | None
     ) = None,
 ) -> SpaceNitEvaluateConfig:
     """Build a SpaceNit evaluation experiment configuration."""
@@ -442,11 +441,11 @@ def main(
     model_config_builder: Callable[[CommonComponents], Config] | None = None,
     dataset_config_builder: Callable[[CommonComponents], Config] | None = None,
     dataloader_config_builder: (
-        Callable[[CommonComponents], SpaceNitDataLoaderConfig] | None
+        Callable[[CommonComponents], GeoTileLoaderConfig] | None
     ) = None,
     trainer_config_builder: Callable[[CommonComponents], TrainerConfig] | None = None,
     train_module_config_builder: (
-        Callable[[CommonComponents], SpaceNitTrainModuleConfig] | None
+        Callable[[CommonComponents], SpaceNitTrainRunnerConfig] | None
     ) = None,
     visualize_config_builder: (
         Callable[[CommonComponents], SpaceNitVisualizeConfig] | None
