@@ -604,16 +604,12 @@ class Decoder(nn.Module):
         self,
         context: Tensor,
         num_predictions: int,
-        *,
-        prediction_positions: Tensor | None = None,
     ) -> Tensor:
         """Decode masked positions.
 
         Args:
             context: Encoder output ``(B, N_ctx, D)``.
             num_predictions: Number of tokens to predict.
-            prediction_positions: ``(B, num_predictions)`` position indices
-                for the mask tokens (used for positional encoding).
 
         Returns:
             Predicted token representations ``(B, num_predictions, D)``.

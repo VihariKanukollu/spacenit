@@ -260,6 +260,9 @@ class CyclicMonthEmbed(nn.Module):
             Embeddings of shape ``(*month_indices.shape, embed_dim)``.
         """
         raw = self.raw_embeddings[month_indices.long()]  # (..., 2)
+        # Under FSDP mixed precision the projection weights may be bfloat16.
+        # Ensure dtype matches to avoid matmul dtype mismatches.
+        raw = raw.to(dtype=self.proj.weight.dtype)
         return self.proj(raw)
 
 

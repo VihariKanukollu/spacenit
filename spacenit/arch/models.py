@@ -385,7 +385,7 @@ class DualBranchConfig(Config):
         return DualBranch(self)
 
 
-class DualBranch(nn.Module):
+class DualBranch(ParallelMixin, nn.Module):
     """Encoder + two decoders for dual-objective training.
 
     Combines latent prediction (JEPA-style) with pixel reconstruction
@@ -449,6 +449,37 @@ class DualBranch(nn.Module):
         _ema_update(self.encoder, self.target_encoder, momentum)
         _ema_update(self.online_proj, self.target_proj, momentum)
         self._step.add_(1)
+
+    def apply_ddp(
+        self,
+        *,
+        dp_mesh: Any | None = None,
+        compile_enabled: bool = False,
+        find_unused_parameters: bool = True,
+    ) -> None:
+        self.enable_ddp(
+            dp_mesh=dp_mesh,
+            compile_enabled=compile_enabled,
+            find_unused_parameters=find_unused_parameters,
+        )
+
+    def apply_fsdp(
+        self,
+        *,
+        dp_mesh: Any | None = None,
+        param_dtype: torch.dtype | None = None,
+        reduce_dtype: torch.dtype = torch.float32,
+    ) -> None:
+        from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+
+        mp = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+        fully_shard(self, mesh=dp_mesh, mp_policy=mp)
+
+    def apply_compile(self) -> None:
+        self.encoder = torch.compile(self.encoder)  # type: ignore[assignment]
+        self.latent_decoder = torch.compile(self.latent_decoder)  # type: ignore[assignment]
+        self.pixel_decoder = torch.compile(self.pixel_decoder)  # type: ignore[assignment]
+        self.online_proj = torch.compile(self.online_proj)  # type: ignore[assignment]
 
     def forward(
         self,
@@ -608,7 +639,7 @@ class SpatioTemporalConfig(Config):
         return SpatioTemporalEncoder(self)
 
 
-class SpatioTemporalEncoder(nn.Module):
+class SpatioTemporalEncoder(ParallelMixin, nn.Module):
     """Encoder with factorized axial attention for spatio-temporal data.
 
     Uses :class:`AxialAttentionBlock` to attend along spatial height,
@@ -650,6 +681,34 @@ class SpatioTemporalEncoder(nn.Module):
         self.proj = ProjectionHead(
             in_dim=dim, out_dim=config.projection_dim
         )
+
+    def apply_ddp(
+        self,
+        *,
+        dp_mesh: Any | None = None,
+        compile_enabled: bool = False,
+        find_unused_parameters: bool = True,
+    ) -> None:
+        self.enable_ddp(
+            dp_mesh=dp_mesh,
+            compile_enabled=compile_enabled,
+            find_unused_parameters=find_unused_parameters,
+        )
+
+    def apply_fsdp(
+        self,
+        *,
+        dp_mesh: Any | None = None,
+        param_dtype: torch.dtype | None = None,
+        reduce_dtype: torch.dtype = torch.float32,
+    ) -> None:
+        from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+
+        mp = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+        fully_shard(self, mesh=dp_mesh, mp_policy=mp)
+
+    def apply_compile(self) -> None:
+        self.encoder = torch.compile(self.encoder)  # type: ignore[assignment]
 
     def forward(
         self,
