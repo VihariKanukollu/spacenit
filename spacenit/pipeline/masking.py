@@ -898,15 +898,90 @@ class _MaskingPolicyFromStrategy:
         self._step = 0
 
     def apply_mask(self, sample: GeoSample, patch_size: int) -> MaskedGeoSample:
-        masked = mask_sample(
-            sample,
-            self._strategy,
-            patch_size=patch_size,
-            step=self._step,
-            generator=None,
-        )
+        # The ingestion collator passes a *batched* GeoSample. For microbatching
+        # to work, masks must be batched too (dim0 = batch size). The underlying
+        # `mask_sample()` utility returns 1D masks per sensor, so we build masks
+        # per instance and stack them.
+        #
+        # We intentionally advance the internal step counter once per *batch*
+        # (not once per instance), so scheduled masking behaves as expected.
+
+        # Infer batch size robustly: timestamps are (B, T, 3) for batched samples.
+        B = 1
+        ts = sample.timestamps
+        if isinstance(ts, torch.Tensor):
+            if ts.ndim == 3:
+                B = int(ts.shape[0])
+        elif ts is not None and hasattr(ts, "ndim") and hasattr(ts, "shape"):
+            # numpy fallback
+            if getattr(ts, "ndim", 0) == 3:
+                B = int(ts.shape[0])
+
+        if B <= 1:
+            masked = mask_sample(
+                sample,
+                self._strategy,
+                patch_size=patch_size,
+                step=self._step,
+                generator=None,
+            )
+            self._step += 1
+            return masked
+
+        per_sample_masks: dict[str, list[torch.Tensor]] = {}
+
+        for b in range(B):
+            fields: dict[str, Any] = {}
+
+            # Meta fields
+            if ts is not None:
+                if isinstance(ts, torch.Tensor) and ts.ndim == 3:
+                    fields["timestamps"] = ts[b]
+                else:
+                    fields["timestamps"] = ts
+
+            latlon = sample.latlon
+            if latlon is not None:
+                if isinstance(latlon, torch.Tensor) and latlon.ndim == 2 and latlon.shape[0] == B:
+                    fields["latlon"] = latlon[b]
+                else:
+                    fields["latlon"] = latlon
+
+            # Sensors: slice the batch dimension when present.
+            for sensor_label in sample.present_sensors:
+                v = sample[sensor_label]
+                if v is None:
+                    continue
+                if isinstance(v, torch.Tensor) and v.ndim >= 4 and v.shape[0] == B:
+                    fields[sensor_label] = v[b]
+                else:
+                    fields[sensor_label] = v
+
+            masked_b = mask_sample(
+                GeoSample(**fields),
+                self._strategy,
+                patch_size=patch_size,
+                step=self._step,
+                generator=None,
+            )
+
+            for mask_key in masked_b._fields:
+                if not mask_key.endswith("_mask"):
+                    continue
+                m = masked_b[mask_key]
+                if isinstance(m, torch.Tensor):
+                    per_sample_masks.setdefault(mask_key, []).append(m)
+
+        # Assemble output: keep the original batched sensor data and attach
+        # batched masks.
+        out_fields: dict[str, Any] = {}
+        for key in sample.present_keys:
+            out_fields[key] = sample[key]
+        for mask_key, parts in per_sample_masks.items():
+            out_fields[mask_key] = torch.stack(parts, dim=0)
+
         self._step += 1
-        return masked
+        return MaskedGeoSample(**out_fields)
 
 
 def build_masking_policy(config: dict[str, Any]) -> MaskingPolicy:
