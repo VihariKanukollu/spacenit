@@ -295,7 +295,7 @@ class FloodScenesDataset(Dataset):
             image = self.normalizer_computed.normalize(SENTINEL1, image)
 
         timestamp = repeat(torch.tensor(self.default_day_month_year), "d -> t d", t=1)
-        masked_sample = MaskedGeoSample.from_spacenitsample(
+        masked_sample = MaskedGeoSample.from_geosample(
             GeoSample(
                 sentinel1=torch.tensor(image).float(), timestamps=timestamp.long()
             )

@@ -33,21 +33,23 @@ class SpaceNitThroughputMonitor(SpeedMonitorCallback):
             train_module,
             AutoEncoderRunner | LatentPredictionRunner | ContrastiveLatentRunner,
         ):
-            self._encoder_ratio = train_module.masking_strategy.encode_ratio
-            self._decoder_ratio = train_module.masking_strategy.decode_ratio
+            self._encoder_ratio = getattr(train_module.masking_strategy, "encode_ratio", 0.25)
+            self._decoder_ratio = getattr(train_module.masking_strategy, "decode_ratio", 0.25)
             logger.warning(
                 "Throughput monitor bases token input on token budget, "
                 "encoder ratio, and decoder ratio"
             )
         elif isinstance(train_module, DualBranchRunner):
-            self._encoder_ratio = train_module.masking_strategy_a.encode_ratio
-            self._decoder_ratio = train_module.masking_strategy_a.decode_ratio
-            if train_module.masking_strategy_b.encode_ratio != self._encoder_ratio:
+            self._encoder_ratio = getattr(train_module.masking_strategy_a, "encode_ratio", 0.25)
+            self._decoder_ratio = getattr(train_module.masking_strategy_a, "decode_ratio", 0.25)
+            enc_b = getattr(train_module.masking_strategy_b, "encode_ratio", 0.25)
+            dec_b = getattr(train_module.masking_strategy_b, "decode_ratio", 0.25)
+            if enc_b != self._encoder_ratio:
                 logger.warning(
                     "Throughput monitor bases token input on encoder ratio "
                     "from masking_strategy_a"
                 )
-            if train_module.masking_strategy_b.decode_ratio != self._decoder_ratio:
+            if dec_b != self._decoder_ratio:
                 logger.warning(
                     "Throughput monitor bases token input on decoder ratio "
                     "from masking_strategy_a"

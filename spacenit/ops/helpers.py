@@ -193,8 +193,8 @@ MODEL_SIZE_ARGS = {
 }
 
 
-class MockSpaceNitDataLoader(DataLoaderBase):
-    """Minimal SpaceNit dataloader that only satisfies the abstract interface."""
+class MockGeoTileLoader(DataLoaderBase):
+    """Minimal dataloader that only satisfies the abstract interface."""
 
     def __init__(self) -> None:
         """Initialize the mock loader with trivial single-rank defaults."""

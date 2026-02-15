@@ -238,7 +238,7 @@ class CropParcelsDataset(Dataset):
         if not sample_dict:
             raise ValueError(f"No valid modalities found in: {self.input_modalities}")
 
-        masked_sample = MaskedGeoSample.from_spacenitsample(
+        masked_sample = MaskedGeoSample.from_geosample(
             GeoSample(**sample_dict)
         )
 

@@ -299,7 +299,7 @@ class MarineDebrisDataset(Dataset):
             image = self.normalizer_computed.normalize(SENTINEL2_L2A, image)
 
         timestamp = repeat(torch.tensor(self.default_day_month_year), "d -> t d", t=1)
-        masked_sample = MaskedGeoSample.from_spacenitsample(
+        masked_sample = MaskedGeoSample.from_geosample(
             GeoSample(
                 sentinel2_l2a=torch.tensor(image).float(), timestamps=timestamp.long()
             )

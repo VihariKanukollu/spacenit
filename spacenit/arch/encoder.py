@@ -19,7 +19,6 @@ Design choices vs. the original codebase:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -33,8 +32,6 @@ from spacenit.arch.embed import (
     AdaptivePatchEmbed,
     CyclicMonthEmbed,
     SensorEmbed,
-    SpatialRoPE,
-    TemporalRoPE,
 )
 from spacenit.ingestion.sensors import SensorRegistry, SensorSpec
 from spacenit.settings import Config
@@ -238,17 +235,6 @@ class Encoder(nn.Module):
         self.tokenizer = MultiSensorTokenizer(config)
 
         # Positional encodings
-        self.spatial_rope = SpatialRoPE(
-            dim=config.embed_dim // config.num_heads,
-            max_grid=config.max_grid,
-            theta=config.rope_theta,
-            reference_gsd=config.reference_gsd,
-        )
-        self.temporal_rope = TemporalRoPE(
-            dim=config.embed_dim // config.num_heads,
-            max_timesteps=config.max_timesteps,
-            theta=config.rope_theta,
-        )
         self.month_embed = CyclicMonthEmbed(config.embed_dim)
 
         # Transformer stack

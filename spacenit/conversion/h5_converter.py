@@ -25,12 +25,12 @@ from spacenit.ingestion.sensors import (
     ANNUAL_STEP_COUNT,
     SAR_NODATA_SENTINEL,
     TILE_EDGE_PIXELS,
+    SensorRegistry,
     SensorSpec,
     TemporalCadence,
     ERA5_10,
     OPENSTREETMAP_RASTER,
     SENTINEL1,
-    specs_from_labels,
 )
 
 from .csv_parser import parse_tile_dataset
@@ -92,7 +92,7 @@ class GeoTileH5WriterConfig(Config):
         """Construct the :class:`GeoTileH5Writer` from this config."""
         return GeoTileH5Writer(
             tile_path=UPath(self.tile_path),
-            supported_sensors=specs_from_labels(self.supported_sensor_labels),
+            supported_sensors=[SensorRegistry.get(lbl) for lbl in self.supported_sensor_labels],
             multiprocessed_h5_creation=self.multiprocessed_h5_creation,
             compression=self.compression,
             compression_opts=self.compression_opts,
@@ -100,7 +100,7 @@ class GeoTileH5WriterConfig(Config):
             chunk_options=self.chunk_options,
             tile_size=self.tile_size,
             reserved_cores=self.reserved_cores,
-            required_sensors=specs_from_labels(self.required_sensor_labels),
+            required_sensors=[SensorRegistry.get(lbl) for lbl in self.required_sensor_labels],
         )
 
 

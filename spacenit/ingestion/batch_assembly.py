@@ -81,7 +81,7 @@ def collate_single_masked_batched(
 
     # Apply transform to the batch (if configured)
     if transform is not None:
-        stacked_sample = transform.apply(stacked_sample)
+        stacked_sample = transform(stacked_sample)
 
     # Apply masking to the batch
     masked_sample = masking_strategy.apply_mask(stacked_sample, patch_size)
@@ -116,7 +116,7 @@ def collate_double_masked_batched(
 
     # Apply transform to the batch (if configured)
     if transform is not None:
-        stacked_sample = transform.apply(stacked_sample)
+        stacked_sample = transform(stacked_sample)
 
     # Apply both masking strategies to the batch
     masked_sample_a = masking_strategy.apply_mask(stacked_sample, patch_size)

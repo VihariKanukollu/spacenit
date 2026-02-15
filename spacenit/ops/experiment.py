@@ -26,7 +26,7 @@ from spacenit.ingestion.rendering import visualize_sample
 from spacenit.profiling.throughput_runner import ThroughputBenchmarkRunnerConfig
 from spacenit.ops.helpers import (
     MockLatentMIMTrainModule,
-    MockSpaceNitDataLoader,
+    MockGeoTileLoader,
 )
 from spacenit.arch.band_tokenization import TokenizationConfig
 from spacenit.pipeline.runners import SpaceNitTrainRunnerConfig
@@ -286,7 +286,7 @@ def evaluate(config: SpaceNitEvaluateConfig) -> None:
     model = config.model.build()
     device = get_default_device()
     model = model.to(device)
-    data_loader = MockSpaceNitDataLoader()
+    data_loader = MockGeoTileLoader()
 
     if config.trainer.load_path is not None:
         if config.train_module is None:

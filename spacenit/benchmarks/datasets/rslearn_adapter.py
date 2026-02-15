@@ -171,8 +171,8 @@ def get_timestamps(
     return dates
 
 
-class RslearnToSpaceNitDataset(Dataset):
-    """Convert rslearn ModelDataset to SpaceNit MaskedGeoSample dataset.
+class RslearnBenchmarkDataset(Dataset):
+    """Convert rslearn ModelDataset to MaskedGeoSample benchmark dataset.
 
     Expects rslearn ModelDataset to yield: (inputs_dict, target, metadata).
     inputs_dict[<modality>] shape: (T*C, H, W) after rslearn transforms.
@@ -202,7 +202,7 @@ class RslearnToSpaceNitDataset(Dataset):
         start_time: str = "2022-09-01",
         end_time: str = "2023-09-01",
     ):
-        """Initialize RslearnToSpaceNitDataset."""
+        """Initialize RslearnBenchmarkDataset."""
         if split not in ("train", "val", "valid", "test"):
             raise ValueError(f"Invalid split {split}")
 
@@ -321,5 +321,5 @@ class RslearnToSpaceNitDataset(Dataset):
         sample_dict["timestamps"] = self.timestamps
 
         spacenit_sample = GeoSample(**sample_dict)
-        masked_sample = MaskedGeoSample.from_spacenitsample(spacenit_sample)
+        masked_sample = MaskedGeoSample.from_geosample(spacenit_sample)
         return masked_sample, target["class"].long()

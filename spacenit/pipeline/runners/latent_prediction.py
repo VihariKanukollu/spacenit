@@ -186,8 +186,6 @@ class LatentPredictionRunner(SpaceNitTrainRunner):
 
                 # Extract sensor data and masks
                 sensor_data = {}
-                visible_indices_list = []
-                target_indices_list = []
 
                 for key in mb.present_keys:
                     data = mb[key]

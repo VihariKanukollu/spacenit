@@ -135,10 +135,11 @@ image = image.transpose(1, 2, 0)[None, :, :, None, :]
 Next, we normalize the image:
 
 ```python
-from spacenit.ingestion.normalization import Normalizer, Strategy
+from spacenit.ingestion.standardizer import Standardizer, Strategy
+from spacenit.ingestion.sensors import SensorRegistry
 
-normalizer = Normalizer(Strategy.COMPUTED)
-image = normalizer.normalize(Sensor.SENTINEL2_L2A, image)
+standardizer = Standardizer(Strategy.COMPUTED)
+image = standardizer.standardize(SensorRegistry.get("sentinel2_l2a"), image)
 ```
 
 Now we can apply the model on the image. We recommend applying it on inputs between

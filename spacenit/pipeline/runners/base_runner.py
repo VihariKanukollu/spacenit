@@ -4,12 +4,11 @@ Integrates with olmo-core's ``TrainModule`` for distributed training
 (FSDP/DDP).  Provides the common training loop infrastructure that
 concrete runners extend.
 
-Rewritten to use the new model/loss/masking APIs while keeping the
-olmo-core integration intact.  Key changes:
+Uses the model/loss/masking APIs with olmo-core integration for
+distributed training.  Key design points:
 - Simplified microbatch loop
 - EMA logic delegated to the model (not duplicated here)
-- Uses new ``TransformConfig`` from rewritten augmentations
-- Removed dependency on old ``ObjectiveConfig`` and ``EmbeddingsAndMasks``
+- Uses ``TransformConfig`` from the augmentations module
 """
 
 from __future__ import annotations

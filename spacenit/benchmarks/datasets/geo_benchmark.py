@@ -290,7 +290,7 @@ class GeoBenchmarkDataset(Dataset):
             sample_dict["sentinel2_l2a"] = torch.tensor(s2).float()
 
         timestamp = repeat(torch.tensor(self.default_day_month_year), "d -> t d", t=1)
-        masked_sample = MaskedGeoSample.from_spacenitsample(
+        masked_sample = MaskedGeoSample.from_geosample(
             GeoSample(**sample_dict, timestamps=timestamp.long())
         )
         return masked_sample, target

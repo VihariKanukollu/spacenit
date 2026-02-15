@@ -183,7 +183,7 @@ class CropTimeseriesDataset(Dataset):
         if self.norm_stats_from_pretrained:
             image = self.normalizer_computed.normalize(SENTINEL2_L2A, image)
 
-        masked_sample = MaskedGeoSample.from_spacenitsample(
+        masked_sample = MaskedGeoSample.from_geosample(
             GeoSample(
                 sentinel2_l2a=torch.tensor(image).float(), timestamps=timestamp.long()
             )

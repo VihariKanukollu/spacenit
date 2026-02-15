@@ -81,7 +81,6 @@ class SpaceNitExperimentLogger(WandBCallback):
     def pre_train(self) -> None:
         """Pre-train hook for the experiment logger."""
         if self.enabled and get_rank() == 0:
-            self.wandb
             if WANDB_API_KEY_ENV_VAR not in os.environ:
                 raise OLMoEnvironmentError(f"missing env var '{WANDB_API_KEY_ENV_VAR}'")
 

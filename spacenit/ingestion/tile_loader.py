@@ -497,7 +497,7 @@ class GeoTileLoader(DataLoaderBase):
 
         # Generate mock samples
         mock_samples = [
-            self._get_mock_sample(rng).subset_default(
+            self._get_mock_sample(rng).crop_rectangular(
                 patch_size,
                 max_tokens_per_instance=1500,
                 sampled_hw_p=6,

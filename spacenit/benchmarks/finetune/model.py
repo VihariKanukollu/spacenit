@@ -72,7 +72,7 @@ def to_device(
     masked: MaskedGeoSample, device: torch.device
 ) -> MaskedGeoSample:
     """Move a MaskedGeoSample to a device with appropriate dtypes."""
-    d = masked.as_dict(return_none=False)
+    d = masked.as_dict(ignore_nones=True)
     for k, v in d.items():
         if k == "timestamps":
             d[k] = v.to(device=device)

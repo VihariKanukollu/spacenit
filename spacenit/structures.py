@@ -145,14 +145,15 @@ class GeoSample:
             result[key] = self._data.get(key)
         return result
 
-    def as_dict(self, return_none: bool = True) -> dict[str, NdTensor | None]:
-        """Alias for :meth:`to_dict` with inverted flag semantics.
+    def as_dict(self, ignore_nones: bool = False) -> dict[str, NdTensor | None]:
+        """Alias for :meth:`to_dict`.
 
         Args:
-            return_none: When ``True``, include ``None`` entries for missing
-                fields.  When ``False``, only populated fields are returned.
+            ignore_nones: When ``True``, only populated fields are included.
+                When ``False`` (default), every registered sensor label plus
+                meta fields are included with ``None`` for missing ones.
         """
-        return self.to_dict(ignore_nones=not return_none)
+        return self.to_dict(ignore_nones=ignore_nones)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> GeoSample:
@@ -665,9 +666,15 @@ class MaskedGeoSample:
 
     # -- dict interop ---------------------------------------------------------
 
-    def to_dict(self, return_none: bool = True) -> dict[str, Any]:
-        """Serialise to a plain dictionary."""
-        if not return_none:
+    def to_dict(self, ignore_nones: bool = True) -> dict[str, Any]:
+        """Serialise to a plain dictionary.
+
+        Args:
+            ignore_nones: When ``True`` (default), only populated fields are
+                included.  When ``False``, every registered sensor label plus
+                meta fields are included with ``None`` for missing ones.
+        """
+        if ignore_nones:
             return {**self._data, **self._masks}
         # Include None for missing sensors/masks
         result: dict[str, Any] = {}
@@ -682,14 +689,15 @@ class MaskedGeoSample:
             result["latlon_mask"] = self._masks.get("latlon_mask")
         return result
 
-    def as_dict(self, return_none: bool = True) -> dict[str, Any]:
-        """Alias for :meth:`to_dict` with the same semantics.
+    def as_dict(self, ignore_nones: bool = False) -> dict[str, Any]:
+        """Alias for :meth:`to_dict`.
 
         Args:
-            return_none: When ``True``, include ``None`` entries for missing
-                fields.  When ``False``, only populated fields are returned.
+            ignore_nones: When ``True``, only populated fields are included.
+                When ``False`` (default), every registered sensor label plus
+                meta fields are included with ``None`` for missing ones.
         """
-        return self.to_dict(return_none=return_none)
+        return self.to_dict(ignore_nones=ignore_nones)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> MaskedGeoSample:
@@ -727,9 +735,6 @@ class MaskedGeoSample:
                         dtype=_np.int64,
                     )
         return cls(**kwargs)
-
-    # Alias for backward compatibility with benchmark code that uses the old name.
-    from_spacenitsample = from_geosample
 
     # -- sensor queries -------------------------------------------------------
 
@@ -769,31 +774,6 @@ class MaskedGeoSample:
             new_masks[mask_key] = val * (val == TokenVisibility.ABSENT.value)
         all_fields = {**self._data, **new_masks}
         return MaskedGeoSample(**all_fields)
-
-    # -- construction ---------------------------------------------------------
-
-    @classmethod
-    def from_geo_sample(cls, sample: GeoSample) -> MaskedGeoSample:
-        """Construct from an unmasked GeoSample.
-
-        Every present sensor receives a mask filled with VISIBLE_ENCODER.
-        """
-        fields: dict[str, Any] = {}
-        for key, tensor in sample._data.items():
-            if key == "timestamps":
-                fields[key] = tensor
-            elif key in _META_FIELDS:
-                fields[key] = tensor
-                fields[cls.mask_field_for(key)] = torch.ones(
-                    sample.dimensions_of(key, mask=False)
-                ) * TokenVisibility.VISIBLE_ENCODER.value
-            else:
-                fields[key] = tensor
-                fields[cls.mask_field_for(key)] = (
-                    torch.ones(sample.dimensions_of(key, mask=False))
-                    * TokenVisibility.VISIBLE_ENCODER.value
-                )
-        return cls(**fields)
 
     @classmethod
     def from_mapping(cls, mapping: dict[str, Any]) -> MaskedGeoSample:

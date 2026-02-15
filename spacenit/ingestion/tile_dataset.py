@@ -349,7 +349,7 @@ class GeoTileDataset(Dataset):
         self, sensor_label: str, height: int | None, width: int | None, time: int
     ) -> np.ndarray:
         """Fill an array of shape of sensor with the absent indicator."""
-        expected_shape = GeoSample.compute_expected_shape(
+        expected_shape = GeoSample.infer_shape(
             sensor_label, height, width, time
         )
         logger.debug(f"Filling {sensor_label} with shape {expected_shape}")
@@ -559,7 +559,7 @@ class GeoTileDataset(Dataset):
         )
 
         if self.apply_cutmix:
-            subset_sample = sample.subset_cutmix(
+            subset_sample = sample.crop_patchwise(
                 patch_size=args.patch_size,
                 max_tokens_per_instance=args.token_budget,
                 sampled_hw_p=args.sampled_hw_p,
@@ -568,7 +568,7 @@ class GeoTileDataset(Dataset):
                 tokenization_config=args.tokenization_config,
             )
         else:
-            subset_sample = sample.subset_default(
+            subset_sample = sample.crop_rectangular(
                 patch_size=args.patch_size,
                 max_tokens_per_instance=args.token_budget,
                 sampled_hw_p=args.sampled_hw_p,

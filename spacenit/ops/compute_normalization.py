@@ -24,8 +24,8 @@ from spacenit.ingestion.sensors import (
 )
 from spacenit.ingestion.merged_dataset import (
     GetItemArgs,
-    SpaceNitDataset,
-    SpaceNitDatasetConfig,
+    GeoTileMergedDataset,
+    GeoTileMergedDatasetConfig,
 )
 from spacenit.ingestion.helpers import update_streaming_stats
 
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 def compute_normalization_values(
-    dataset: SpaceNitDataset,
+    dataset: GeoTileMergedDataset,
     estimate_from: int | None = None,
 ) -> dict[str, Any]:
     """Compute the normalization values for the dataset in a streaming manner.
@@ -97,8 +97,7 @@ def compute_normalization_values(
 
     norm_dict["total_n"] = dataset_len
     norm_dict["sampled_n"] = len(indices_to_sample)
-    path = dataset.h5py_dir or dataset.tile_path
-    norm_dict["tile_path"] = str(path)
+    norm_dict["tile_path"] = str(dataset.h5py_dir)
 
     return norm_dict
 
@@ -122,7 +121,7 @@ if __name__ == "__main__":
 
     supported_modalities = parse_supported_modalities(args_dict["supported_modalities"])
     logger.info(f"Supported modalities: {supported_modalities}")
-    dataset_config = SpaceNitDatasetConfig(
+    dataset_config = GeoTileMergedDatasetConfig(
         h5py_dir=args_dict["h5py_dir"],
         training_modalities=supported_modalities,
         normalize=False,

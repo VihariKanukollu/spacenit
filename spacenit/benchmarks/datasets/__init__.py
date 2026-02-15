@@ -124,9 +124,9 @@ def get_benchmark_dataset(
             norm_method=norm_method,
         )
     elif benchmark_dataset == "nandi":
-        from .rslearn_adapter import RslearnToSpaceNitDataset
+        from .rslearn_adapter import RslearnBenchmarkDataset
 
-        return RslearnToSpaceNitDataset(
+        return RslearnBenchmarkDataset(
             ds_path=storage.NANDI_DIR,
             ds_groups=["groundtruth_polygon_split_window_32"],
             layers=input_layers,
@@ -143,9 +143,9 @@ def get_benchmark_dataset(
             ds_norm_stats_json="nandi_band_stats.json",
         )
     elif benchmark_dataset == "awf":
-        from .rslearn_adapter import RslearnToSpaceNitDataset
+        from .rslearn_adapter import RslearnBenchmarkDataset
 
-        return RslearnToSpaceNitDataset(
+        return RslearnBenchmarkDataset(
             ds_path=storage.AWF_DIR,
             ds_groups=["20250822"],
             layers=input_layers,

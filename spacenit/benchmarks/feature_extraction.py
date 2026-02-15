@@ -36,7 +36,7 @@ def get_features(
     total_samples = len(data_loader)
     with torch.no_grad():
         for i, (sample, label) in enumerate(data_loader):
-            sample_dict = sample.as_dict(return_none=False)
+            sample_dict = sample.as_dict(ignore_nones=True)
             for key, val in sample_dict.items():
                 if key == "timestamps":
                     sample_dict[key] = val.to(device=device)
