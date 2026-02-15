@@ -65,23 +65,37 @@ def _build_rope_freqs(dim: int, max_len: int, theta: float = 10000.0) -> Tensor:
 def apply_rotary_emb(x: Tensor, freqs: Tensor) -> Tensor:
     """Apply rotary embeddings to the last dimension of *x*.
 
+    Supports both position-table and per-token frequency tensors:
+
+    - **Position table** (legacy): ``freqs`` is ``(T, D//2)`` and is
+      broadcast over batch and head dimensions.
+    - **Per-token** (new): ``freqs`` is ``(B, T, D//2)`` and is broadcast
+      over the head dimension only.
+
     Args:
-        x: ``(..., D)`` real-valued tensor where ``D`` is even.
-        freqs: ``(T, D//2)`` complex rotation factors (from ``_build_rope_freqs``).
+        x: ``(B, H, T, D)`` real-valued tensor (queries or keys after
+            head reshaping) where ``D`` is even.
+        freqs: Complex rotation factors -- either ``(T, D//2)`` or
+            ``(B, T, D//2)``.
 
     Returns:
         Tensor of same shape as *x* with rotary embeddings applied.
     """
-    # Reshape x into pairs: (..., D//2, 2) -> view as complex
+    # Reshape x into pairs: (B, H, T, D//2, 2) -> view as complex
     orig_shape = x.shape
     x_pairs = x.float().reshape(*orig_shape[:-1], -1, 2)
     x_complex = torch.view_as_complex(x_pairs)
+    # x_complex: (B, H, T, D//2)
 
-    # Broadcast freqs to match x dimensions
-    # freqs is (T, D//2), x_complex is (..., T, D//2) or (..., D//2)
-    ndim_diff = x_complex.ndim - freqs.ndim
-    shape = [1] * ndim_diff + list(freqs.shape)
-    freqs = freqs.view(*shape).to(x_complex.device)
+    # Broadcast freqs to match x_complex
+    if freqs.ndim == 2:
+        # (T, D//2) -> (1, 1, T, D//2)
+        freqs = freqs.unsqueeze(0).unsqueeze(0)
+    elif freqs.ndim == 3:
+        # (B, T, D//2) -> (B, 1, T, D//2)
+        freqs = freqs.unsqueeze(1)
+
+    freqs = freqs.to(x_complex.device)
 
     rotated = x_complex * freqs
     return torch.view_as_real(rotated).flatten(-2).to(x.dtype)
@@ -160,8 +174,15 @@ class GroupedQueryAttention(nn.Module):
 
         # Apply rotary embeddings to Q and K
         if rope_freqs is not None:
-            q = apply_rotary_emb(q, rope_freqs[:N])
-            k = apply_rotary_emb(k, rope_freqs[:M])
+            # rope_freqs may be (T, D//2) or (B, T, D//2).
+            # Slice the sequence dimension appropriately.
+            if rope_freqs.ndim == 2:
+                q = apply_rotary_emb(q, rope_freqs[:N])
+                k = apply_rotary_emb(k, rope_freqs[:M])
+            else:
+                # (B, T, D//2) -- per-token frequencies
+                q = apply_rotary_emb(q, rope_freqs[:, :N])
+                k = apply_rotary_emb(k, rope_freqs[:, :M])
 
         # Expand KV heads for grouped-query attention
         if self.num_kv_groups > 1:

@@ -4,39 +4,8 @@ Small helper functions and mix-in classes used across the neural-network
 components in :mod:`spacenit.arch`.
 """
 
-from typing import Any
-
 import torch
 from torch.distributed import DeviceMesh
-
-
-def extract_encoder_outputs(
-    output_dict: dict[str, Any],
-) -> tuple:
-    """Decompose an encoder's output dictionary into its canonical parts.
-
-    Pops the well-known keys (latent tokens, projected/pooled
-    representation, normalisation statistics) and returns everything else
-    as pass-through keyword arguments for a downstream decoder.
-
-    Args:
-        output_dict: Dictionary produced by an encoder's forward pass.
-            Modified in-place – consumed keys are removed.
-
-    Returns:
-        A three-element tuple of:
-
-        * **latent** – the raw token-and-mask container (or ``None``).
-        * **latent_projected_and_pooled** – the projected and aggregated
-          representation (or ``None``).
-        * **decoder_kwargs** – remaining entries forwarded to the decoder.
-    """
-    latent = output_dict.pop("tokens_and_masks", None)
-    latent_projected_and_pooled = output_dict.pop("project_aggregated", None)
-    # Normalisation statistics are consumed but not forwarded.
-    output_dict.pop("token_norm_stats", None)
-    decoder_kwargs = output_dict
-    return latent, latent_projected_and_pooled, decoder_kwargs
 
 
 def cumulative_seq_offsets(seq_lengths: torch.Tensor) -> torch.Tensor:

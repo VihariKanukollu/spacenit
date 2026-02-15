@@ -37,13 +37,17 @@ class TestMultiSensorTokenizer:
         C = spec.total_channels
         sensor_data = {labels[0]: torch.randn(2, C, 16, 16)}
 
-        tokens, sensor_ids, layout = tokenizer(sensor_data)
+        tokens, sensor_ids, spatial_ids, temporal_ids, layout = tokenizer(sensor_data)
 
         # 16/8 = 2 patches per dim, 2*2 = 4 patches + 1 type token = 5
         assert tokens.shape[0] == 2
         assert tokens.shape[2] == 64
         assert tokens.shape[1] == 5  # 4 patches + 1 sensor type token
         assert sensor_ids.shape == tokens.shape[:2]
+        assert spatial_ids.shape == (2, 5, 2)
+        assert temporal_ids.shape == (2, 5)
+        # Sensor-type token should have spatial_id (-1, -1)
+        assert (spatial_ids[:, 0] == -1).all()
         assert len(layout) == 1
         assert layout[0][0] == labels[0]
 
@@ -67,7 +71,7 @@ class TestMultiSensorTokenizer:
             C = spec.total_channels
             sensor_data[label] = torch.randn(2, C, 16, 16)
 
-        tokens, sensor_ids, layout = tokenizer(sensor_data)
+        tokens, sensor_ids, spatial_ids, temporal_ids, layout = tokenizer(sensor_data)
 
         assert tokens.shape[0] == 2
         assert tokens.shape[2] == 64

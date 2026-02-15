@@ -20,6 +20,7 @@ from olmo_core.train.common import ReduceType
 
 from spacenit.arch.models import AutoEncoder
 from spacenit.ingestion.augmentations import TransformConfig
+from spacenit.pipeline.helpers import partition_masked_batch
 from spacenit.pipeline.losses import ReconstructionLoss
 from spacenit.pipeline.masking import build_masking
 from spacenit.pipeline.runners.base_runner import (
@@ -106,7 +107,7 @@ class AutoEncoderRunner(SpaceNitTrainRunner):
         total_loss = torch.zeros([], device=self.device)
         patch_size, batch_data = batch
 
-        microbatches = _partition(batch_data, self.rank_microbatch_size)
+        microbatches = partition_masked_batch(batch_data, self.rank_microbatch_size)
         num_mb = len(microbatches)
 
         for mb_idx, mb in enumerate(microbatches):
@@ -138,19 +139,3 @@ class AutoEncoderRunner(SpaceNitTrainRunner):
             self.trainer.record_metric(
                 "train/reconstruction_loss", total_loss, ReduceType.mean
             )
-
-
-def _partition(batch: MaskedGeoSample, size: int) -> list[MaskedGeoSample]:
-    B = batch.num_samples
-    if B <= size:
-        return [batch]
-    parts = []
-    for s in range(0, B, size):
-        e = min(s + size, B)
-        fields = {}
-        for key in batch._fields:
-            val = batch[key]
-            if val is not None and hasattr(val, "__getitem__"):
-                fields[key] = val[s:e]
-        parts.append(MaskedGeoSample(**fields))
-    return parts

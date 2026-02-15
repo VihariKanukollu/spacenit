@@ -383,97 +383,58 @@ class GeoTileLoader(DataLoaderBase):
         return "_".join(parts)
 
     def _get_mock_sample(self, rng: np.random.Generator) -> GeoSample:
-        output_dict = {}
-        standard_hw = 64
-        if SensorRegistry.get("sentinel2_l2a").label in self.dataset.training_modalities:
-            mock_sentinel2_l2a = rng.random(
-                (standard_hw, standard_hw, 12, 12), dtype=np.float32
-            )
-            output_dict["sentinel2_l2a"] = mock_sentinel2_l2a
-        if SensorRegistry.get("naip_10").label in self.dataset.training_modalities:
-            mock_naip_10 = rng.random((1024, 1024, 1, 4), dtype=np.float32)
-            output_dict["naip_10"] = mock_naip_10
-        if SensorRegistry.get("sentinel1").label in self.dataset.training_modalities:
-            mock_sentinel1 = rng.random(
-                (standard_hw, standard_hw, 12, 2), dtype=np.float32
-            )
-            output_dict[SensorRegistry.get("sentinel1").label] = mock_sentinel1
-        if SensorRegistry.get("worldcover").label in self.dataset.training_modalities:
-            mock_worldcover = rng.random(
-                (standard_hw, standard_hw, 1, 1), dtype=np.float32
-            )
-            output_dict["worldcover"] = mock_worldcover
-        if SensorRegistry.get("latlon").label in self.dataset.training_modalities:
-            mock_latlon = rng.random((2,), dtype=np.float32)
-            output_dict["latlon"] = mock_latlon
-        if SensorRegistry.get("openstreetmap_raster").label in self.dataset.training_modalities:
-            mock_openstreetmap_raster = rng.random(
-                (standard_hw, standard_hw, 1, 30), dtype=np.float32
-            )
-            output_dict["openstreetmap_raster"] = mock_openstreetmap_raster
-        if SensorRegistry.get("srtm").label in self.dataset.training_modalities:
-            mock_srtm = rng.random(
-                (standard_hw, standard_hw, 1, 1), dtype=np.float32
-            )
-            output_dict["srtm"] = mock_srtm
-        if SensorRegistry.get("landsat").label in self.dataset.training_modalities:
-            mock_landsat = rng.random(
-                (
-                    standard_hw,
-                    standard_hw,
-                    12,
-                    SensorRegistry.get("landsat").total_channels,
-                ),
-                dtype=np.float32,
-            )
-            output_dict["landsat"] = mock_landsat
-        if SensorRegistry.get("gse").label in self.dataset.training_modalities:
-            mock_gse = rng.random(
-                (standard_hw, standard_hw, 1, SensorRegistry.get("gse").total_channels),
-                dtype=np.float32,
-            )
-            output_dict["gse"] = mock_gse
-        if SensorRegistry.get("cdl").label in self.dataset.training_modalities:
-            mock_cdl = rng.random(
-                (standard_hw, standard_hw, 1, SensorRegistry.get("cdl").total_channels),
-                dtype=np.float32,
-            )
-            output_dict["cdl"] = mock_cdl
-        if SensorRegistry.get("worldpop").label in self.dataset.training_modalities:
-            mock_worldpop = rng.random(
-                (
-                    standard_hw,
-                    standard_hw,
-                    1,
-                    SensorRegistry.get("worldpop").total_channels,
-                ),
-                dtype=np.float32,
-            )
-            output_dict["worldpop"] = mock_worldpop
-        if (
-            SensorRegistry.get("wri_canopy_height_map").label
-            in self.dataset.training_modalities
-        ):
-            mock_wri_canopy_height_map = rng.random(
-                (
-                    standard_hw,
-                    standard_hw,
-                    1,
-                    SensorRegistry.get("wri_canopy_height_map").total_channels,
-                ),
-                dtype=np.float32,
-            )
-            output_dict["wri_canopy_height_map"] = mock_wri_canopy_height_map
-        if SensorRegistry.get("era5_10").label in self.dataset.training_modalities:
-            mock_era5_10 = rng.random(
-                (12, SensorRegistry.get("era5_10").total_channels), dtype=np.float32
-            )
-            output_dict["era5_10"] = mock_era5_10
+        """Generate a mock GeoSample from the SensorRegistry.
 
-        days = rng.integers(0, 25, (12, 1))
-        months = rng.integers(0, 12, (12, 1))
-        years = rng.integers(2018, 2020, (12, 1))
-        timestamps = np.concatenate([days, months, years], axis=1)  # (12, 3)
+        Shapes are derived dynamically from each sensor's SensorSpec so
+        that new sensors are automatically supported without editing this
+        method.
+        """
+        output_dict: dict[str, np.ndarray] = {}
+        standard_hw = 64
+        mock_timesteps = 12
+
+        for label in self.dataset.training_modalities:
+            try:
+                spec = SensorRegistry.get(label)
+            except (ValueError, KeyError):
+                continue
+
+            C = spec.total_channels
+
+            if label == "latlon":
+                # Special case: latlon is a flat (2,) vector.
+                output_dict[label] = rng.random((2,), dtype=np.float32)
+                continue
+
+            # Determine spatial edge length from the spec.
+            if spec.varies_in_space:
+                hw = spec.expected_tile_edge()
+                # Clamp to a reasonable mock size to avoid huge allocations.
+                hw = min(hw, standard_hw * max(1, spec.tile_size_multiplier))
+            else:
+                hw = None
+
+            if spec.varies_in_space_and_time:
+                output_dict[label] = rng.random(
+                    (standard_hw, standard_hw, mock_timesteps, C),
+                    dtype=np.float32,
+                )
+            elif spec.varies_in_space_only:
+                output_dict[label] = rng.random(
+                    (standard_hw, standard_hw, 1, C), dtype=np.float32
+                )
+            elif spec.varies_in_time_only:
+                output_dict[label] = rng.random(
+                    (mock_timesteps, C), dtype=np.float32
+                )
+            else:
+                # Scalar / static sensor
+                output_dict[label] = rng.random((C,), dtype=np.float32)
+
+        days = rng.integers(0, 25, (mock_timesteps, 1))
+        months = rng.integers(0, 12, (mock_timesteps, 1))
+        years = rng.integers(2018, 2020, (mock_timesteps, 1))
+        timestamps = np.concatenate([days, months, years], axis=1)  # (T, 3)
 
         output_dict["timestamps"] = timestamps
         return GeoSample(**output_dict)
@@ -625,7 +586,7 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[GeoSample]):
             instances_processed += 1
 
     @property
-    def dataset(self) -> GeoTileDataset:
+    def dataset(self) -> GeoTileDataset | GeoTileMergedDataset:
         """Get the dataset."""
         return self.data_loader.dataset
 

@@ -7,5 +7,5 @@ New modules (deep rewrite):
 - :mod:`heads` -- Pixel, projection, and pooling heads
 - :mod:`models` -- LatentPredictor, AutoEncoder, DualBranch, SpatioTemporalEncoder
 
-Legacy modules (band_tokenization, helpers) remain for backward compatibility.
+Utility modules: helpers (ParallelMixin, cumulative_seq_offsets), band_tokenization.
 """

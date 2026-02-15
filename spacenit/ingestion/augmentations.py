@@ -113,14 +113,10 @@ def _apply_dihedral_to_spatial(x: Tensor, sym: int) -> Tensor:
 
     The spatial dimensions are always the first two after any batch dim.
     """
-    # Determine spatial dims based on tensor rank
-    # For our data layout, spatial dims are always 0,1 (unbatched) or 1,2 (batched)
-    has_batch = x.ndim >= 4 and x.shape[0] < x.shape[1]  # heuristic
-
-    if has_batch:
-        h_dim, w_dim = 1, 2
-    else:
-        h_dim, w_dim = 0, 1
+    # This function is called on per-sample (unbatched) GeoSample fields.
+    # Spatial dims are always the first two: (H, W, ...).
+    # Shapes: (H, W, C) for spatial-only, (H, W, T, C) for spatiotemporal.
+    h_dim, w_dim = 0, 1
 
     if sym == 0:
         return x  # identity

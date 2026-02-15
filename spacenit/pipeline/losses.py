@@ -5,8 +5,8 @@ Replaces ``objectives.py`` with different implementations:
 - :class:`LatentPredictionLoss` -- Smooth L1 loss (Huber) on predicted vs
   target latents (replaces L1/L2 with smooth L1 as default).
 - :class:`ContrastiveLoss` -- InfoNCE with learnable temperature and
-  ``torch.cdist``-based pairwise distances (replaces einsum-based similarity
-  with fixed temperature).
+  dot-product similarity (``torch.mm``) on L2-normalized vectors (replaces
+  einsum-based similarity with fixed temperature).
 - :class:`ReconstructionLoss` -- pixel reconstruction with configurable
   loss function.
 - :class:`UniformityLoss` -- negative log of average pairwise distance
@@ -75,10 +75,10 @@ class LatentPredictionLoss(nn.Module):
 class ContrastiveLoss(nn.Module):
     """InfoNCE contrastive loss with learnable temperature.
 
-    Uses ``torch.cdist`` for pairwise distance computation instead of
-    einsum-based similarity matrices.  The temperature parameter is
-    learnable (log-parameterized for numerical stability), unlike the
-    original fixed temperature.
+    Uses ``torch.mm`` (dot product) on L2-normalized vectors for pairwise
+    similarity computation.  The temperature parameter is learnable
+    (log-parameterized for numerical stability), unlike the original
+    fixed temperature.
 
     Supports both patch-level and global (pooled) contrastive learning.
 
@@ -131,10 +131,8 @@ class ContrastiveLoss(nn.Module):
         pos_sim = (anchors * positives).sum(dim=-1) / temp
 
         if negatives is None:
-            # Use all other batch elements as negatives
-            # Similarity matrix: (B, B)
-            # Using cdist to compute pairwise distances, then convert to similarity
-            # sim = -cdist^2 / 2 = dot product (for L2-normalized vectors)
+            # Use all other batch elements as negatives.
+            # Similarity matrix: (B, B) via dot product on L2-normalized vectors.
             sim_matrix = torch.mm(anchors, positives.t()) / temp
             # Mask out self-similarity on diagonal
             B = anchors.shape[0]
@@ -315,7 +313,7 @@ class CompositeLoss(nn.Module):
             Tuple of (total_loss, per_loss_dict) where per_loss_dict maps
             loss names to their individual (unweighted) values.
         """
-        total = torch.tensor(0.0, device=self._get_device())
+        total: Tensor | None = None
         individual: dict[str, Tensor] = {}
 
         for name in self._loss_names:
@@ -332,12 +330,13 @@ class CompositeLoss(nn.Module):
 
             loss_val = module(**kwargs)
             individual[name] = loss_val.detach()
-            total = total + weight * loss_val
+
+            weighted = weight * loss_val
+            total = weighted if total is None else total + weighted
+
+        # If no losses were computed, return a zero tensor (should not
+        # happen in practice).
+        if total is None:
+            total = torch.tensor(0.0)
 
         return total, individual
-
-    def _get_device(self) -> torch.device:
-        """Infer device from parameters."""
-        for p in self.parameters():
-            return p.device
-        return torch.device("cpu")

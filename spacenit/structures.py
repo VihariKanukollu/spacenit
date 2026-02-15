@@ -79,10 +79,15 @@ class GeoSample:
     def __getattr__(self, key: str) -> NdTensor | None:
         if key.startswith("_"):
             raise AttributeError(key)
-        try:
-            return self._data.get(key)
-        except AttributeError:
-            raise AttributeError(key) from None
+        # Return stored fields when present.
+        if key in self._data:
+            return self._data[key]
+        # For backward-compat, allow attribute access for known sensor/meta
+        # keys and return None when missing. For any other attribute name,
+        # raise AttributeError (important so `hasattr()` behaves correctly).
+        if key in _META_FIELDS or SensorRegistry.contains(key):
+            return None
+        raise AttributeError(key)
 
     def __getitem__(self, key: str) -> NdTensor | None:
         return self._data.get(key)
@@ -531,6 +536,58 @@ class GeoSample:
 
         return GeoSample(**new_fields)
 
+    # -----------------------------------------------------------------------
+    # Backward-compatible ingestion helpers
+    # -----------------------------------------------------------------------
+
+    def subset_default(
+        self,
+        patch_size: int,
+        max_tokens_per_instance: int | None,
+        sampled_hw_p: int,
+        current_length: int,
+        missing_timesteps_masks: dict[str, Any] | None = None,
+        tokenization_config: "TokenizationConfig | None" = None,
+    ) -> "GeoSample":
+        """Backward-compatible wrapper used by the ingestion dataset.
+
+        Historically the ingestion pipeline called ``subset_default`` to apply
+        token-budget-aware spatiotemporal cropping.  The newer API exposes
+        ``crop_rectangular`` / ``crop_patchwise``; for now we map to a simple
+        rectangular crop.
+        """
+        return self.crop_rectangular(
+            patch_size=patch_size,
+            max_tokens_per_instance=max_tokens_per_instance,
+            sampled_hw_p=sampled_hw_p,
+            current_length=current_length,
+            missing_timesteps_masks=missing_timesteps_masks,
+            tokenization_config=tokenization_config,
+        )
+
+    def subset_cutmix(
+        self,
+        patch_size: int,
+        max_tokens_per_instance: int | None,
+        sampled_hw_p: int,
+        current_length: int,
+        missing_timesteps_masks: dict[str, Any] | None = None,
+        tokenization_config: "TokenizationConfig | None" = None,
+    ) -> "GeoSample":
+        """Fallback implementation for CutMix subsetting.
+
+        The current deep-rewrite codepath doesn't implement CutMix; for
+        compatibility we fall back to the default subset logic.
+        """
+        return self.subset_default(
+            patch_size=patch_size,
+            max_tokens_per_instance=max_tokens_per_instance,
+            sampled_hw_p=sampled_hw_p,
+            current_length=current_length,
+            missing_timesteps_masks=missing_timesteps_masks,
+            tokenization_config=tokenization_config,
+        )
+
     # -- arithmetic -----------------------------------------------------------
 
     def multiply(self, s: float) -> GeoSample:
@@ -620,8 +677,17 @@ class MaskedGeoSample:
         if key.startswith("_"):
             raise AttributeError(key)
         if key.endswith("_mask"):
-            return self._masks.get(key)
-        return self._data.get(key)
+            if key in self._masks:
+                return self._masks[key]
+            sensor_label = key[: -len("_mask")]
+            if SensorRegistry.contains(sensor_label):
+                return None
+            raise AttributeError(key)
+        if key in self._data:
+            return self._data[key]
+        if key in _META_FIELDS or SensorRegistry.contains(key):
+            return None
+        raise AttributeError(key)
 
     def __getitem__(self, key: str) -> NdTensor | None:
         if key.endswith("_mask"):
@@ -765,7 +831,7 @@ class MaskedGeoSample:
 
     @staticmethod
     def data_field_for(mask_field_name: str) -> str:
-        return mask_field_name.replace("_mask", "")
+        return mask_field_name.removesuffix("_mask")
 
     def clear_masks(self) -> MaskedGeoSample:
         """Reset all masks: ABSENT stays ABSENT, everything else -> VISIBLE_ENCODER."""

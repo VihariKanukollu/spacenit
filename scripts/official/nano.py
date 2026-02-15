@@ -1,8 +1,17 @@
 """SpaceNit Nano model training configuration."""
 
 import logging
+import sys
+from pathlib import Path
 
-from script import (
+# Ensure the script directory is on sys.path so sibling modules resolve
+# regardless of the working directory (e.g. when invoked via torchrun from
+# the repository root).
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from script import (  # noqa: E402
     build_common_components,
     build_dataloader_config,
     build_dataset_config,

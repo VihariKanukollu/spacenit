@@ -315,7 +315,9 @@ class GeoTileDataset(Dataset):
         """
         try:
             return self.standardizer_computed.standardize(sensor, image)
-        except Exception:
+        except KeyError:
+            # Computed stats not available for this sensor; fall back to
+            # predefined normalization constants.
             return self.standardizer_predefined.standardize(sensor, image)
 
     def _fill_missing_timesteps(
@@ -577,7 +579,8 @@ class GeoTileDataset(Dataset):
                 tokenization_config=args.tokenization_config,
             )
 
-        sample_dict = subset_sample.as_dict(ignore_nones=True)
+        # GeoSample exposes `to_dict(ignore_nones=...)` (and `as_dict(return_none=...)`).
+        sample_dict = subset_sample.to_dict(ignore_nones=True)
 
         if self.normalize:
             for sensor_name in sample_dict.keys():
@@ -597,11 +600,32 @@ class GeoTileDataset(Dataset):
                 standardized_data = self.standardize_image(
                     SensorRegistry.get(sensor_name), sensor_data
                 )
-                # Sentinel values must be reset after standardization so they
-                # can be recognised by the missing mask.
-                sample_dict[sensor_name] = np.where(
-                    missing_mask, sensor_data, standardized_data
-                ).astype(self.dtype)
+                # Replace absent pixels/timesteps with 0 after standardization.
+                # Keeping ABSENT_INDICATOR in the model input can cause extreme
+                # activations and NaNs early in training.
+                cleaned = np.where(
+                    missing_mask, 0.0, standardized_data
+                )
+                # Also defensively scrub any NaN/Inf values that may appear
+                # from standardization or raw H5 contents.
+                cleaned = np.nan_to_num(cleaned, nan=0.0, posinf=0.0, neginf=0.0)
+                sample_dict[sensor_name] = cleaned.astype(self.dtype)
+
+        # Regardless of whether we standardized a modality (or skipped it because
+        # it's fully missing), never allow ABSENT_INDICATOR / NaN / Inf into the
+        # model inputs.
+        for sensor_name, sensor_data in list(sample_dict.items()):
+            if sensor_name == "timestamps":
+                continue
+            if sensor_data is None:
+                continue
+            # Ensure correct dtype and replace missing sentinel with zeros.
+            sensor_data = sensor_data.astype(self.dtype, copy=False)
+            missing_mask = sensor_data == ABSENT_INDICATOR
+            if np.any(missing_mask):
+                sensor_data = np.where(missing_mask, 0.0, sensor_data)
+            sensor_data = np.nan_to_num(sensor_data, nan=0.0, posinf=0.0, neginf=0.0)
+            sample_dict[sensor_name] = sensor_data.astype(self.dtype, copy=False)
 
         return args.patch_size, GeoSample(**sample_dict)
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from spacenit.ingestion.augmentations import Transform
+from spacenit.ingestion.sensors import SensorRegistry
 from spacenit.structures import (
     GeoSample,
     MaskedGeoSample,
@@ -47,6 +48,26 @@ def collate_geo_tiles(
             [torch.from_numpy(getattr(sample, attr)) for _, sample in batch],
             dim=0,
         )
+        # Reorder into model-friendly layouts.
+        #
+        # Ingestion H5 convention is typically (H, W, T, C) for spacetime sensors
+        # and (H, W, C) for spatial-only sensors. The model expects channel-first:
+        # - temporal: (B, C, H, W, T)
+        # - spatial:  (B, C, H, W)
+        if attr in ("timestamps", "latlon"):
+            return stacked_tensor
+        spec = SensorRegistry.get(attr)
+        if spec.varies_in_space_and_time and stacked_tensor.ndim == 5:
+            # (B,H,W,T,C) -> (B,C,H,W,T)
+            return stacked_tensor.permute(0, 4, 1, 2, 3).contiguous()
+        if spec.varies_in_space_only:
+            # Some spatial-only sensors are stored with a singleton temporal dim:
+            # (H,W,1,C) -> batched (B,H,W,1,C). Squeeze it.
+            if stacked_tensor.ndim == 5 and stacked_tensor.shape[3] == 1:
+                stacked_tensor = stacked_tensor.squeeze(3)
+            if stacked_tensor.ndim == 4:
+                # (B,H,W,C) -> (B,C,H,W)
+                return stacked_tensor.permute(0, 3, 1, 2).contiguous()
         return stacked_tensor
 
     patch_size, batch_zero = batch[0]

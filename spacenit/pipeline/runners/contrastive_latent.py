@@ -21,6 +21,7 @@ from olmo_core.train.common import ReduceType
 
 from spacenit.arch.models import LatentPredictor
 from spacenit.ingestion.augmentations import TransformConfig
+from spacenit.pipeline.helpers import partition_masked_batch
 from spacenit.pipeline.losses import ContrastiveLoss, UniformityLoss
 from spacenit.pipeline.masking import build_masking
 from spacenit.pipeline.runners.base_runner import (
@@ -116,7 +117,7 @@ class ContrastiveLatentRunner(SpaceNitTrainRunner):
         total_loss = torch.zeros([], device=self.device)
         patch_size, batch_data = batch
 
-        microbatches = _partition(batch_data, self.rank_microbatch_size)
+        microbatches = partition_masked_batch(batch_data, self.rank_microbatch_size)
         num_mb = len(microbatches)
 
         for mb_idx, mb in enumerate(microbatches):
@@ -139,28 +140,19 @@ class ContrastiveLatentRunner(SpaceNitTrainRunner):
                     month_indices = None
 
                 with self._model_forward_context():
-                    # Use encoder representations (pooled) for InfoNCE.
-                    online_tokens, _, _ = self.model.encoder(
+                    # Use model.forward() with contrastive_only=True so that
+                    # any future changes to the encoder/target-encoder API are
+                    # handled in one place.
+                    outputs = self.model(
                         sensor_data,
                         patch_size=patch_size,
                         month_indices=month_indices,
+                        contrastive_only=True,
                     )
-                    online_pooled = online_tokens.mean(dim=1)
-                    online_z = self.model.online_proj(online_pooled)
 
-                    with torch.no_grad():
-                        target_tokens, _, _ = self.model.target_encoder(
-                            sensor_data,
-                            patch_size=patch_size,
-                            month_indices=month_indices,
-                        )
-                        target_pooled = target_tokens.mean(dim=1)
-                        target_z = self.model.target_proj(target_pooled)
-
-                # Stabilize InfoNCE: expect unit-norm vectors.
-                online_z = F.normalize(online_z, dim=-1)
+                online_z = F.normalize(outputs["online_proj"], dim=-1)
                 with torch.no_grad():
-                    target_z = F.normalize(target_z, dim=-1)
+                    target_z = F.normalize(outputs["target_proj"], dim=-1)
 
                 loss = self.contrastive_loss(online_z, target_z)
 
@@ -186,19 +178,3 @@ class ContrastiveLatentRunner(SpaceNitTrainRunner):
             self.trainer.record_metric(
                 "train/contrastive_loss", total_loss, ReduceType.mean
             )
-
-
-def _partition(batch: MaskedGeoSample, size: int) -> list[MaskedGeoSample]:
-    B = batch.num_samples
-    if B <= size:
-        return [batch]
-    parts = []
-    for s in range(0, B, size):
-        e = min(s + size, B)
-        fields = {}
-        for key in batch._fields:
-            val = batch[key]
-            if val is not None and hasattr(val, "__getitem__"):
-                fields[key] = val[s:e]
-        parts.append(MaskedGeoSample(**fields))
-    return parts

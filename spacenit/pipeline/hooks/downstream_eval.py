@@ -369,7 +369,8 @@ class DownstreamEvalRunner:
         result = self.eval_function(**kwargs)  # type: ignore
 
         # Free memory aggressively between evals
-        del train_embeddings, train_labels, test_embeddings, test_labels
+        del train_embeddings, train_labels, val_embeddings, val_labels
+        del test_embeddings, test_labels
         torch.cuda.empty_cache()
         gc.collect()
 

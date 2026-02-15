@@ -26,6 +26,7 @@ from torch import Tensor
 
 from spacenit.arch.attention import RMSNorm, TransformerBlock, TransformerStack
 from spacenit.arch.encoder import Decoder, Encoder, EncoderConfig
+from spacenit.arch.helpers import ParallelMixin
 from spacenit.arch.heads import PixelHead, PoolingHead, ProjectionHead
 from spacenit.settings import Config
 
@@ -72,7 +73,7 @@ class LatentPredictorConfig(Config):
         return LatentPredictor(self)
 
 
-class LatentPredictor(nn.Module):
+class LatentPredictor(ParallelMixin, nn.Module):
     """Encoder + momentum encoder + decoder for latent prediction.
 
     The online encoder processes visible tokens.  The momentum (target)
@@ -121,7 +122,9 @@ class LatentPredictor(nn.Module):
             p.requires_grad = False
 
         self._ema_momentum = config.ema_momentum
-        self._step = 0
+        self.register_buffer(
+            "_step", torch.tensor(0, dtype=torch.long), persistent=True
+        )
 
     @torch.no_grad()
     def step_ema(self) -> None:
@@ -131,12 +134,49 @@ class LatentPredictor(nn.Module):
         ``ema_momentum_end`` over ``ema_warmup_steps``.
         """
         cfg = self.config
-        progress = min(self._step / max(cfg.ema_warmup_steps, 1), 1.0)
+        step_val = self._step.item()
+        progress = min(step_val / max(cfg.ema_warmup_steps, 1), 1.0)
         momentum = cfg.ema_momentum + (cfg.ema_momentum_end - cfg.ema_momentum) * progress
         _ema_update(self.encoder, self.target_encoder, momentum)
         _ema_update(self.online_proj, self.target_proj, momentum)
         self._ema_momentum = momentum
-        self._step += 1
+        self._step.add_(1)
+
+    # ------------------------------------------------------------------
+    # Distributed / compile helpers (expected by BaseRunner)
+    # ------------------------------------------------------------------
+
+    def apply_ddp(
+        self,
+        *,
+        dp_mesh: Any | None = None,
+        compile_enabled: bool = False,
+        find_unused_parameters: bool = True,
+    ) -> None:
+        self.enable_ddp(
+            dp_mesh=dp_mesh,
+            compile_enabled=compile_enabled,
+            find_unused_parameters=find_unused_parameters,
+        )
+
+    def apply_fsdp(
+        self,
+        *,
+        dp_mesh: Any | None = None,
+        param_dtype: torch.dtype | None = None,
+        reduce_dtype: torch.dtype = torch.float32,
+    ) -> None:
+        # FSDP2 composable API.
+        from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+
+        mp = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+        fully_shard(self, mesh=dp_mesh, mp_policy=mp)
+
+    def apply_compile(self) -> None:
+        # Optional; used only when runner requests compile.
+        self.encoder = torch.compile(self.encoder)  # type: ignore[assignment]
+        self.decoder = torch.compile(self.decoder)  # type: ignore[assignment]
+        self.online_proj = torch.compile(self.online_proj)  # type: ignore[assignment]
 
     def forward(
         self,
@@ -147,6 +187,7 @@ class LatentPredictor(nn.Module):
         patch_size: int | None = None,
         month_indices: Tensor | None = None,
         gsd: float = 10.0,
+        contrastive_only: bool = False,
     ) -> dict[str, Tensor]:
         """Forward pass.
 
@@ -158,13 +199,21 @@ class LatentPredictor(nn.Module):
             patch_size: Runtime patch size.
             month_indices: Month-of-year indices.
             gsd: Ground-sample distance.
+            contrastive_only: If ``True``, skip the decoder and produce
+                mean-pooled encoder representations for contrastive
+                learning.  Returns ``"online_proj"`` and
+                ``"target_proj"`` only (both ``(B, projection_dim)``).
 
         Returns:
-            Dictionary with keys:
+            Dictionary with keys (full mode):
             - ``"predictions"`` -- decoder output ``(B, N_tgt, D)``.
             - ``"targets"`` -- target encoder output ``(B, N_tgt, D)``.
             - ``"online_proj"`` -- projected online representations.
             - ``"target_proj"`` -- projected target representations.
+
+            Or (contrastive_only mode):
+            - ``"online_proj"`` -- ``(B, projection_dim)`` L2-normalised.
+            - ``"target_proj"`` -- ``(B, projection_dim)`` L2-normalised.
         """
         # Online encoder (visible tokens only)
         encoded, sensor_ids, layout = self.encoder(
@@ -183,6 +232,26 @@ class LatentPredictor(nn.Module):
                 month_indices=month_indices,
                 gsd=gsd,
             )
+
+        # ----------------------------------------------------------
+        # Contrastive-only mode: pool + project, skip decoder
+        # ----------------------------------------------------------
+        if contrastive_only:
+            online_pooled = encoded.mean(dim=1)       # (B, D)
+            online_z = self.online_proj(online_pooled)
+
+            with torch.no_grad():
+                target_pooled = target_encoded.mean(dim=1)
+                target_z = self.target_proj(target_pooled)
+
+            return {
+                "online_proj": online_z,
+                "target_proj": target_z.detach(),
+            }
+
+        # ----------------------------------------------------------
+        # Full mode: decode + project
+        # ----------------------------------------------------------
 
         # Extract target representations at prediction positions
         num_predictions = target_indices.shape[1] if target_indices is not None else 0
@@ -366,17 +435,20 @@ class DualBranch(nn.Module):
         for p in self.target_proj.parameters():
             p.requires_grad = False
 
-        self._step = 0
+        self.register_buffer(
+            "_step", torch.tensor(0, dtype=torch.long), persistent=True
+        )
 
     @torch.no_grad()
     def step_ema(self) -> None:
         """Perform one EMA update step."""
         cfg = self.config
-        progress = min(self._step / max(cfg.ema_warmup_steps, 1), 1.0)
+        step_val = self._step.item()
+        progress = min(step_val / max(cfg.ema_warmup_steps, 1), 1.0)
         momentum = cfg.ema_momentum + (cfg.ema_momentum_end - cfg.ema_momentum) * progress
         _ema_update(self.encoder, self.target_encoder, momentum)
         _ema_update(self.online_proj, self.target_proj, momentum)
-        self._step += 1
+        self._step.add_(1)
 
     def forward(
         self,
@@ -613,18 +685,42 @@ class SpatioTemporalEncoder(nn.Module):
             gsd=gsd,
         )
 
-        # Apply axial attention
+        # Separate sensor-type tokens (spatial_id == -1) from spatial tokens.
+        # The tokenizer prepends one sensor-type token per sensor, so we use
+        # the layout to identify them: each sensor contributes 1 type token
+        # followed by its spatial tokens.
+        type_token_indices: list[int] = []
+        spatial_token_indices: list[int] = []
+        offset = 0
+        for _label, n_tokens in layout:
+            type_token_indices.append(offset)  # first token is the type token
+            spatial_token_indices.extend(range(offset + 1, offset + n_tokens))
+            offset += n_tokens
+
+        B, N, D = encoded.shape
+        type_idx = torch.tensor(type_token_indices, device=encoded.device)
+        spatial_idx = torch.tensor(spatial_token_indices, device=encoded.device)
+
+        type_tokens = encoded[:, type_idx]        # (B, num_sensors, D)
+        spatial_tokens = encoded[:, spatial_idx]   # (B, H*W*T, D)
+
+        # Apply axial attention only to spatial tokens
         for axial_layer in self.axial_layers:
-            encoded = axial_layer(encoded, H, W, T)
+            spatial_tokens = axial_layer(spatial_tokens, H, W, T)
 
-        encoded = self.norm(encoded)
+        # Recombine: restore original token order
+        recombined = encoded.clone()
+        recombined[:, type_idx] = type_tokens
+        recombined[:, spatial_idx] = spatial_tokens
 
-        # Pool and project
-        pooled = self.pool(encoded)
+        recombined = self.norm(recombined)
+
+        # Pool and project (over all tokens including type tokens)
+        pooled = self.pool(recombined)
         projected = self.proj(pooled)
 
         return {
-            "encoded": encoded,
+            "encoded": recombined,
             "pooled": pooled,
             "projected": projected,
         }

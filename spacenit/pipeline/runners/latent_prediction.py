@@ -21,6 +21,7 @@ from olmo_core.train.common import ReduceType
 
 from spacenit.arch.models import LatentPredictor, LatentPredictorConfig
 from spacenit.ingestion.augmentations import TransformConfig
+from spacenit.pipeline.helpers import partition_masked_batch
 from spacenit.pipeline.losses import (
     CompositeLoss,
     ContrastiveLoss,
@@ -177,7 +178,7 @@ class LatentPredictionRunner(SpaceNitTrainRunner):
         batch_data = batch[1]
 
         # Split into microbatches
-        microbatches = _partition_masked_batch(batch_data, self.rank_microbatch_size)
+        microbatches = partition_masked_batch(batch_data, self.rank_microbatch_size)
         num_microbatches = len(microbatches)
 
         for mb_idx, mb in enumerate(microbatches):
@@ -235,24 +236,3 @@ class LatentPredictionRunner(SpaceNitTrainRunner):
             self.trainer.record_metric(
                 "train/total_loss", total_loss, ReduceType.mean
             )
-
-
-def _partition_masked_batch(
-    batch: MaskedGeoSample, microbatch_size: int
-) -> list[MaskedGeoSample]:
-    """Split a batch into microbatches."""
-    B = batch.num_samples
-    if B <= microbatch_size:
-        return [batch]
-
-    microbatches = []
-    for start in range(0, B, microbatch_size):
-        end = min(start + microbatch_size, B)
-        fields: dict[str, Any] = {}
-        for key in batch._fields:
-            val = batch[key]
-            if val is not None and hasattr(val, "__getitem__"):
-                fields[key] = val[start:end]
-        microbatches.append(MaskedGeoSample(**fields))
-
-    return microbatches

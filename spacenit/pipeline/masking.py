@@ -527,6 +527,106 @@ def apply_strategy(
 # ---------------------------------------------------------------------------
 
 
+def _mark_absent_tokens(
+    mask: Tensor,
+    data: Tensor,
+    spec: Any,
+    patch_size: int,
+    absent_indicator: int,
+    absent_value: int,
+) -> None:
+    """In-place: set mask entries to *absent_value* where data is missing.
+
+    A token is considered absent when **all** of its underlying data values
+    equal ``absent_indicator``.  The check is performed at the token level
+    (after spatial patchification and temporal slicing).
+
+    Supports spatial (``H, W``), spatio-temporal (``H, W, T``), temporal
+    (``T``), and scalar sensor layouts.  Batch dimensions are stripped
+    before comparison (the mask is 1-D over tokens).
+    """
+    # Work on the last-few dims regardless of batch prefix.
+    d = data.detach()
+
+    # Squeeze leading batch dims to get a canonical shape.
+    while d.ndim > 4 and d.shape[0] == 1:
+        d = d.squeeze(0)
+
+    total_channels = getattr(spec, "total_channels", None)
+
+    if spec.varies_in_space_and_time:
+        # Canonical: (C, H, W, T)
+        if d.ndim == 5:
+            if total_channels is not None and d.shape[1] == total_channels:
+                d = d[0]  # drop batch -> (C, H, W, T)
+            else:
+                d = d[0].permute(3, 0, 1, 2)  # (H,W,T,C) -> (C,H,W,T)
+        elif d.ndim == 4:
+            if total_channels is None or d.shape[0] != total_channels:
+                d = d.permute(3, 0, 1, 2)  # (H,W,T,C) -> (C,H,W,T)
+        else:
+            return  # can't determine layout
+
+        C, H, W, T = d.shape
+        P = patch_size * spec.tile_size_multiplier
+        Hp, Wp = H // P, W // P
+        # Reshape to (C, Hp, P, Wp, P, T) -> check per-patch-per-timestep
+        if H % P != 0 or W % P != 0:
+            return
+        d = d.reshape(C, Hp, P, Wp, P, T)
+        # All channels absent in a patch-timestep? -> (Hp, Wp, T) bool
+        absent_map = (d == absent_indicator).all(dim=(0, 2, 4))
+        # Repeat for each spectral group -> (num_groups * Hp * Wp * T,)
+        absent_flat = absent_map.reshape(-1).repeat(spec.group_count)
+        if absent_flat.shape[0] == mask.shape[0]:
+            mask[absent_flat] = absent_value
+
+    elif spec.varies_in_space_only:
+        if d.ndim == 5:
+            d = d[0]  # drop batch
+        if d.ndim == 4:
+            if total_channels is not None and d.shape[1] == total_channels:
+                d = d[0]  # drop batch -> (C, H, W)
+            elif total_channels is not None and d.shape[0] == total_channels:
+                pass  # already (C, H, W)
+            else:
+                d = d.permute(2, 0, 1) if d.ndim == 3 else d[0].permute(2, 0, 1)
+        elif d.ndim == 3:
+            if total_channels is None or d.shape[0] != total_channels:
+                d = d.permute(2, 0, 1)  # (H,W,C) -> (C,H,W)
+        else:
+            return
+
+        C, H, W = d.shape
+        P = patch_size * spec.tile_size_multiplier
+        Hp, Wp = H // P, W // P
+        if H % P != 0 or W % P != 0:
+            return
+        d = d.reshape(C, Hp, P, Wp, P)
+        absent_map = (d == absent_indicator).all(dim=(0, 2, 4))  # (Hp, Wp)
+        absent_flat = absent_map.reshape(-1).repeat(spec.group_count)
+        if absent_flat.shape[0] == mask.shape[0]:
+            mask[absent_flat] = absent_value
+
+    elif spec.varies_in_time_only:
+        if d.ndim >= 3:
+            d = d.reshape(-1, d.shape[-1]) if d.ndim > 2 else d
+        if d.ndim == 2:
+            # (C, T) or (T, C)
+            if total_channels is not None and d.shape[0] == total_channels:
+                absent_per_t = (d == absent_indicator).all(dim=0)  # (T,)
+            else:
+                absent_per_t = (d == absent_indicator).all(dim=1)  # (T,)
+            absent_flat = absent_per_t.repeat(spec.group_count)
+            if absent_flat.shape[0] == mask.shape[0]:
+                mask[absent_flat] = absent_value
+
+    # Scalar sensors: if all values are absent, mark the single token
+    elif spec.group_count == 1 and mask.shape[0] == 1:
+        if (d == absent_indicator).all():
+            mask[0] = absent_value
+
+
 def mask_sample(
     sample: GeoSample,
     strategy: MaskingStrategy,
@@ -574,32 +674,79 @@ def mask_sample(
         fields[sensor_label] = data
 
         # Determine token count and spatial/temporal structure
+        total_channels = getattr(spec, "total_channels", None)
+
         if spec.varies_in_space_and_time:
-            # (H, W, T, C) or (B, H, W, T, C)
-            if data.ndim == 4:
-                H, W, T, C = data.shape
+            # Accept either channel-last (H,W,T,C)/(B,H,W,T,C) or channel-first
+            # (C,H,W,T)/(B,C,H,W,T) layouts (the ingestion collator may permute).
+            if data.ndim == 5:
+                if total_channels is not None and data.shape[1] == total_channels:
+                    _, C, H, W, T = data.shape
+                else:
+                    _, H, W, T, C = data.shape
+            elif data.ndim == 4:
+                if total_channels is not None and data.shape[0] == total_channels:
+                    C, H, W, T = data.shape
+                else:
+                    H, W, T, C = data.shape
             else:
-                _, H, W, T, C = data.shape
+                raise ValueError(
+                    f"Unexpected ndim={data.ndim} for spacetime sensor {sensor_label}"
+                )
             H_p = H // (patch_size * spec.tile_size_multiplier)
             W_p = W // (patch_size * spec.tile_size_multiplier)
             num_tokens = H_p * W_p * T * spec.group_count
             spatial_shape = (H_p, W_p)
             temporal_length = T
         elif spec.varies_in_space_only:
-            if data.ndim == 3:
-                H, W, C = data.shape
+            # Accept (H,W,C)/(B,H,W,C) or channel-first (C,H,W)/(B,C,H,W).
+            # Some spatial-only sensors may be stored with a singleton time dim:
+            # (H,W,1,C)/(B,H,W,1,C) or (C,H,W,1)/(B,C,H,W,1).
+            if data.ndim == 5:
+                if total_channels is not None and data.shape[1] == total_channels:
+                    _, C, H, W, T = data.shape
+                else:
+                    _, H, W, T, C = data.shape
+                # Treat singleton-T as spatial-only.
+                if T != 1:
+                    raise ValueError(
+                        f"Expected singleton time dim for spatial-only sensor {sensor_label}, got T={T}"
+                    )
+            elif data.ndim == 4:
+                if total_channels is not None and data.shape[1] == total_channels:
+                    _, C, H, W = data.shape
+                else:
+                    _, H, W, C = data.shape
+            elif data.ndim == 3:
+                if total_channels is not None and data.shape[0] == total_channels:
+                    C, H, W = data.shape
+                else:
+                    H, W, C = data.shape
             else:
-                _, H, W, C = data.shape
+                raise ValueError(
+                    f"Unexpected ndim={data.ndim} for spatial sensor {sensor_label}"
+                )
             H_p = H // (patch_size * spec.tile_size_multiplier)
             W_p = W // (patch_size * spec.tile_size_multiplier)
             num_tokens = H_p * W_p * spec.group_count
             spatial_shape = (H_p, W_p)
             temporal_length = None
         elif spec.varies_in_time_only:
-            if data.ndim == 2:
-                T, C = data.shape
+            # Accept (T,C)/(B,T,C) or channel-first (C,T)/(B,C,T).
+            if data.ndim == 3:
+                if total_channels is not None and data.shape[1] == total_channels:
+                    _, C, T = data.shape
+                else:
+                    _, T, C = data.shape
+            elif data.ndim == 2:
+                if total_channels is not None and data.shape[0] == total_channels:
+                    C, T = data.shape
+                else:
+                    T, C = data.shape
             else:
-                _, T, C = data.shape
+                raise ValueError(
+                    f"Unexpected ndim={data.ndim} for time-only sensor {sensor_label}"
+                )
             num_tokens = T * spec.group_count
             spatial_shape = None
             temporal_length = T
@@ -619,14 +766,14 @@ def mask_sample(
             generator=generator,
         )
 
-        # Mark absent data
+        # Mark absent data: any token whose underlying data is entirely
+        # ABSENT_INDICATOR should be marked ABSENT regardless of the
+        # masking strategy's decision.
         if isinstance(data, torch.Tensor):
-            absent_indicator = ABSENT_INDICATOR
-            # Check for absent tokens (all channels == ABSENT_INDICATOR)
-            if spec.varies_in_space_and_time and data.ndim >= 4:
-                # Reshape to token level and check
-                pass  # Absent detection is complex; keep mask as-is for now
-                # The data loader should have already set ABSENT_INDICATOR
+            ABS = TokenVisibility.ABSENT.value
+            _mark_absent_tokens(
+                mask, data, spec, patch_size, ABSENT_INDICATOR, ABS,
+            )
 
         mask_key = f"{sensor_label}_mask"
         fields[mask_key] = mask
@@ -664,7 +811,7 @@ def build_masking(config: dict) -> MaskingStrategy:
         "scheduled": ScheduledMasking,
     }
 
-    strategy_type = config.pop("type", "random")
+    strategy_type = config.get("type", "random")
     cls = _REGISTRY.get(strategy_type)
     if cls is None:
         raise ValueError(
@@ -672,14 +819,17 @@ def build_masking(config: dict) -> MaskingStrategy:
             f"Available: {list(_REGISTRY.keys())}"
         )
 
+    # Build kwargs without the "type" key (don't mutate the caller's dict)
+    kwargs = {k: v for k, v in config.items() if k != "type"}
+
     # Recursively build sub-strategies for composite
-    if strategy_type == "composite" and "strategies" in config:
-        config["strategies"] = [
+    if strategy_type == "composite" and "strategies" in kwargs:
+        kwargs["strategies"] = [
             build_masking(s) if isinstance(s, dict) else s
-            for s in config["strategies"]
+            for s in kwargs["strategies"]
         ]
 
-    return cls(**config)
+    return cls(**kwargs)
 
 
 # ---------------------------------------------------------------------------
