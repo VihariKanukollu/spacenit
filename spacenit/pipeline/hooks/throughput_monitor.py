@@ -29,12 +29,18 @@ class SpaceNitThroughputMonitor(SpeedMonitorCallback):
         train_module = self.trainer.train_module
 
         self._token_budget = self.trainer.data_loader.token_budget
+        # Default: unsupported runner types will not report token-throughput
+        # metrics (but should never crash training).
+        self._supports_token_throughput = False
+        self._encoder_ratio = 0.0
+        self._decoder_ratio = 0.0
         if isinstance(
             train_module,
             AutoEncoderRunner | LatentPredictionRunner | ContrastiveLatentRunner,
         ):
             self._encoder_ratio = getattr(train_module.masking_strategy, "encode_ratio", 0.25)
             self._decoder_ratio = getattr(train_module.masking_strategy, "decode_ratio", 0.25)
+            self._supports_token_throughput = True
             logger.warning(
                 "Throughput monitor bases token input on token budget, "
                 "encoder ratio, and decoder ratio"
@@ -42,6 +48,7 @@ class SpaceNitThroughputMonitor(SpeedMonitorCallback):
         elif isinstance(train_module, DualBranchRunner):
             self._encoder_ratio = getattr(train_module.masking_strategy_a, "encode_ratio", 0.25)
             self._decoder_ratio = getattr(train_module.masking_strategy_a, "decode_ratio", 0.25)
+            self._supports_token_throughput = True
             enc_b = getattr(train_module.masking_strategy_b, "encode_ratio", 0.25)
             dec_b = getattr(train_module.masking_strategy_b, "decode_ratio", 0.25)
             if enc_b != self._encoder_ratio:
@@ -61,7 +68,7 @@ class SpaceNitThroughputMonitor(SpeedMonitorCallback):
         else:
             logger.warning(
                 "Throughput monitor only calculates token throughput with "
-                "AutoEncoderRunner, LatentPredictionRunner, or DualBranchRunner"
+                "AutoEncoderRunner, LatentPredictionRunner, ContrastiveLatentRunner, or DualBranchRunner"
             )
 
     def pre_load_batch(self) -> None:
@@ -78,6 +85,11 @@ class SpaceNitThroughputMonitor(SpeedMonitorCallback):
         """Pre-step hook for the throughput monitor."""
         self._batch_load_time = time.perf_counter() - self._batch_load_start
         if self._first_step:
+            return
+        if not getattr(self, "_supports_token_throughput", False):
+            # Unsupported train modules: don't estimate token throughput.
+            self.model_start_time = time.perf_counter()
+            self._total_steps += 1
             return
         # Batch can be 2-tuple (patch_size, sample) or 3-tuple (patch_size, sample_a, sample_b)
         sample: MaskedGeoSample = batch[1]
@@ -121,38 +133,39 @@ class SpaceNitThroughputMonitor(SpeedMonitorCallback):
         bps_avg = self._total_steps / total_time
         self._bps_avg = bps_avg
         data_pct = 100 * self._batch_load_time / step_time
-        tps_encoded = self._total_tokens_encoded / step_time
-        tps_encoded_avg = self._total_tokens_encoded / total_time
-        tps_decoded = self._total_tokens_decoded / step_time
-        tps_decoded_avg = self._total_tokens_decoded / total_time
-        tps_target_encoder = self._total_tokens_target_encoder / step_time
-        tps_target_encoder_avg = self._total_tokens_target_encoder / total_time
-        self.trainer.record_metric(
-            "throughput/total tokens target encoder-since-restart",
-            self._total_tokens_target_encoder,
-        )
+        if getattr(self, "_supports_token_throughput", False):
+            tps_encoded = self._total_tokens_encoded / step_time
+            tps_encoded_avg = self._total_tokens_encoded / total_time
+            tps_decoded = self._total_tokens_decoded / step_time
+            tps_decoded_avg = self._total_tokens_decoded / total_time
+            tps_target_encoder = self._total_tokens_target_encoder / step_time
+            tps_target_encoder_avg = self._total_tokens_target_encoder / total_time
+            self.trainer.record_metric(
+                "throughput/total tokens target encoder-since-restart",
+                self._total_tokens_target_encoder,
+            )
 
-        self.trainer.record_metric(
-            "throughput/total tokens encoded-since-restart", self._total_tokens_encoded
-        )
-        self.trainer.record_metric(
-            "throughput/total tokens decoded-since-restart", self._total_tokens_decoded
-        )
-        self.trainer.record_metric("throughput/device/TPS Encoded", tps_encoded)
-        self.trainer.record_metric(
-            "throughput/device/TPS Target Encoder", tps_target_encoder
-        )
-        self.trainer.record_metric(
-            "throughput/device/TPS Target Encoder (estimated avg)",
-            tps_target_encoder_avg,
-        )
-        self.trainer.record_metric(
-            "throughput/device/TPS Encoded (estimated avg)", tps_encoded_avg
-        )
-        self.trainer.record_metric("throughput/device/TPS Decoded", tps_decoded)
-        self.trainer.record_metric(
-            "throughput/device/TPS Decoded (estimated avg)", tps_decoded_avg
-        )
+            self.trainer.record_metric(
+                "throughput/total tokens encoded-since-restart", self._total_tokens_encoded
+            )
+            self.trainer.record_metric(
+                "throughput/total tokens decoded-since-restart", self._total_tokens_decoded
+            )
+            self.trainer.record_metric("throughput/device/TPS Encoded", tps_encoded)
+            self.trainer.record_metric(
+                "throughput/device/TPS Target Encoder", tps_target_encoder
+            )
+            self.trainer.record_metric(
+                "throughput/device/TPS Target Encoder (estimated avg)",
+                tps_target_encoder_avg,
+            )
+            self.trainer.record_metric(
+                "throughput/device/TPS Encoded (estimated avg)", tps_encoded_avg
+            )
+            self.trainer.record_metric("throughput/device/TPS Decoded", tps_decoded)
+            self.trainer.record_metric(
+                "throughput/device/TPS Decoded (estimated avg)", tps_decoded_avg
+            )
         self.trainer.record_metric("throughput/device/data loading (%)", data_pct)
         self.trainer.record_metric("throughput/device/BPS", bps)
         self.trainer.record_metric("throughput/device/BPS (estimated avg)", bps_avg)

@@ -218,3 +218,8 @@ class TokenizationConfig:
                     f"Valid labels: {SensorRegistry.all_labels()}"
                 )
             layout.check_consistency(base_spec)
+
+    # The rest of the SpaceNit config system expects a `validate()` method.
+    def validate(self) -> None:
+        """Alias for :meth:`check_consistency`."""
+        self.check_consistency()

@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from spacenit.arch.attention import RMSNorm, TransformerStack
+from spacenit.arch.attention import TransformerStack
 from spacenit.arch.band_tokenization import TokenizationConfig
 from spacenit.arch.embed import (
     AdaptivePatchEmbed,
@@ -72,6 +72,7 @@ class EncoderConfig(Config):
     num_kv_heads: int | None = None
     ffn_expansion: float = 8 / 3
     dropout: float = 0.0
+    drop_path: float = 0.0
     base_patch_size: int = 16
     max_grid: int = 64
     max_timesteps: int = 64
@@ -359,10 +360,11 @@ class Encoder(nn.Module):
             num_kv_heads=config.num_kv_heads,
             ffn_expansion=config.ffn_expansion,
             dropout=config.dropout,
+            drop_path=config.drop_path,
         )
 
-        # Final normalization
-        self.norm = RMSNorm(config.embed_dim)
+        # Final normalization (OLMo-Earth uses LayerNorm)
+        self.norm = nn.LayerNorm(config.embed_dim)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -487,7 +489,7 @@ class Encoder(nn.Module):
         month_indices: Tensor | None = None,
         gsd: float = 10.0,
         mask_indices: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, list[tuple[str, int]]]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, list[tuple[str, int]]]:
         """Encode multi-sensor input.
 
         Args:
@@ -502,6 +504,10 @@ class Encoder(nn.Module):
             Tuple of:
             - ``encoded``: ``(B, N, D)`` encoded token representations.
             - ``sensor_ids``: ``(B, N)`` sensor IDs for each token.
+            - ``spatial_ids``: ``(B, N, 2)`` (row, col) per token
+              (``-1`` for sensor-type tokens).
+            - ``temporal_ids``: ``(B, N)`` timestep index per token
+              (``-1`` for sensor-type / non-temporal tokens).
             - ``layout``: Sequence structure description.
         """
         # Tokenize -- now also returns spatial and temporal position ids
@@ -513,8 +519,12 @@ class Encoder(nn.Module):
         if month_indices is not None:
             tokens = self._apply_month_embedding(tokens, temporal_ids, month_indices)
 
-        # Build RoPE frequencies from spatial/temporal metadata
-        rope_freqs = self._build_rope_freqs(spatial_ids, temporal_ids, gsd)
+        # Build RoPE frequencies from spatial/temporal metadata.
+        # IMPORTANT: incorporate patch_size so spatial positions are in
+        # consistent physical units across variable patch sizes (matches
+        # OLMo-Earth's resolution-scaled sincos encodings).
+        P = patch_size or self.config.base_patch_size
+        rope_freqs = self._build_rope_freqs(spatial_ids, temporal_ids, gsd * float(P))
 
         # Apply masking (select subset of tokens)
         if mask_indices is not None:
@@ -524,6 +534,10 @@ class Encoder(nn.Module):
             tokens = torch.gather(tokens, dim=1, index=idx)
             sid_idx = mask_indices
             sensor_ids = torch.gather(sensor_ids, dim=1, index=sid_idx)
+            temporal_ids = torch.gather(temporal_ids, dim=1, index=sid_idx)
+            # Subset spatial_ids: (B, N, 2) -> gather on dim=1
+            sp_idx = mask_indices.unsqueeze(-1).expand(-1, -1, 2)
+            spatial_ids = torch.gather(spatial_ids, dim=1, index=sp_idx)
             # Also subset the RoPE frequencies (complex tensors need
             # real-view gather since torch.gather doesn't support complex)
             rope_real = torch.view_as_real(rope_freqs)  # (B, N, F, 2)
@@ -537,7 +551,7 @@ class Encoder(nn.Module):
         encoded = self.transformer(tokens, rope_freqs=rope_freqs)
         encoded = self.norm(encoded)
 
-        return encoded, sensor_ids, layout
+        return encoded, sensor_ids, spatial_ids, temporal_ids, layout
 
 
 # ---------------------------------------------------------------------------
@@ -546,17 +560,30 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    """Cross-attention decoder for masked prediction.
+    """Cross-attention decoder for latent masked-image modelling.
 
-    Uses bidirectional cross-attention: query tokens attend to encoder
-    context, AND encoder context attends to query tokens.  This is
-    different from the original one-way cross-attention approach.
+    Follows the OLMo-Earth decoder pattern:
 
-    Self-attention and cross-attention use independent parameter sets
-    (separate ``TransformerStack`` instances).
+    1. Receive the **full** token sequence (visible + masked positions).
+    2. Apply ``input_norm`` then ``encoder_to_decoder_embed`` (learned
+       linear projection, even when encoder and decoder dims match).
+    3. Replace tokens at *masked* positions with a learnable
+       ``mask_token``.
+    4. **Re-apply positional encodings** (month + sensor embeddings) to
+       ALL tokens, including mask tokens.  This gives mask tokens
+       explicit positional identity -- matching OLMo-Earth's
+       ``composite_encodings`` call inside the decoder.
+    5. Sort tokens so that decode-targets come first and context
+       (visible) tokens come last.
+    6. Run cross-attention blocks: decode-target tokens attend to
+       context tokens.
+    7. Recombine tokens into the original ordering and return.
+
+    The caller is responsible for extracting the positions it cares
+    about (e.g. ``PREDICTED`` positions for the loss).
 
     Args:
-        embed_dim: Token dimension.
+        embed_dim: Encoder token dimension (input to the decoder).
         depth: Number of decoder transformer layers.
         num_heads: Number of attention heads.
         num_kv_heads: Number of KV heads for GQA.
@@ -572,14 +599,41 @@ class Decoder(nn.Module):
         num_kv_heads: int | None = None,
         ffn_expansion: float = 8 / 3,
         dropout: float = 0.0,
+        num_sensors: int = 32,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
 
-        # Learnable mask tokens (one per position to predict)
+        # Encoder-to-decoder projection (learned transform, even same-dim).
+        self.input_norm = nn.LayerNorm(embed_dim)
+        self.encoder_to_decoder_embed = nn.Linear(embed_dim, embed_dim)
+
+        # Learnable mask token (replaces masked positions).
+        # Shape (1, 1, D) for checkpoint compatibility with existing saves.
         self.mask_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
 
-        # Transformer with cross-attention
+        # Positional re-encoding modules (matching OLMo-Earth's
+        # ``composite_encodings`` in the decoder).  These give mask
+        # tokens explicit spatial/temporal/sensor identity.
+        self.month_embed = CyclicMonthEmbed(embed_dim)
+        self.sensor_embed = SensorEmbed(
+            num_sensors=num_sensors, embed_dim=embed_dim,
+        )
+
+        # Additive sincos spatial + temporal embeddings for the decoder.
+        # OLMo-Earth splits the embedding dim into 4 equal parts and
+        # fills each with a different sincos encoding.  We follow the
+        # same approach: the decoder gets its own additive positional
+        # encodings (separate from the encoder's RoPE).
+        #
+        # We precompute the sincos inverse-frequency vectors and build
+        # the actual embeddings on-the-fly from spatial_ids / temporal_ids
+        # in _apply_positional_reencoding().
+        self._sincos_dim = embed_dim  # full dim, split 50/50 spatial/temporal
+        self._spatial_dim = embed_dim // 2  # half for spatial (row+col)
+        self._temporal_dim = embed_dim - self._spatial_dim  # other half
+
+        # Cross-attention transformer: decode-targets attend to context.
         self.transformer = TransformerStack(
             dim=embed_dim,
             depth=depth,
@@ -590,48 +644,259 @@ class Decoder(nn.Module):
             cross_attention=True,
         )
 
-        # Bidirectional: context also attends to queries
-        self.context_cross_attn = TransformerStack(
-            dim=embed_dim,
-            depth=1,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            ffn_expansion=ffn_expansion,
-            dropout=dropout,
-            cross_attention=True,
-        )
+        self.norm = nn.LayerNorm(embed_dim)
 
-        self.norm = RMSNorm(embed_dim)
+    @staticmethod
+    def _sincos_1d(positions: Tensor, dim: int) -> Tensor:
+        """1D sincos positional encoding (matching OLMo-Earth).
+
+        Args:
+            positions: ``(L,)`` or ``(B, L)`` integer positions.
+            dim: Encoding dimension (must be even).
+
+        Returns:
+            ``(*positions.shape, dim)`` sincos encoding.
+        """
+        # Mirror olmoearth_pretrain.nn.encodings.get_1d_sincos_pos_encoding.
+        assert dim % 2 == 0, f"dim must be even, got {dim}"
+        omega = torch.arange(dim // 2, device=positions.device).float() / dim / 2.0
+        omega = 1.0 / (10000.0**omega)  # (dim/2,)
+
+        pos = positions.reshape(-1).float()  # (L,)
+        out = torch.einsum("l,d->ld", pos, omega)  # (L, dim/2)
+        enc = torch.cat([out.sin(), out.cos()], dim=1)  # (L, dim)
+        return enc.view(*positions.shape, dim)
+
+    def _apply_positional_reencoding(
+        self,
+        x: Tensor,
+        sensor_ids: Tensor,
+        spatial_ids: Tensor | None,
+        temporal_ids: Tensor | None,
+        month_indices: Tensor | None,
+        patch_size: int | None,
+        gsd: float,
+    ) -> Tensor:
+        """Re-apply additive positional encodings to all tokens.
+
+        This is the SpaceNit analogue of OLMo-Earth calling
+        ``composite_encodings`` inside the decoder after mask token
+        replacement.  It ensures that mask tokens (which start as
+        position-blind learned vectors) receive explicit positional
+        identity before cross-attention.
+
+        OLMo-Earth's ``composite_encodings`` adds four components
+        (channel, time-position, month, spatial) each occupying 25%
+        of the embedding dimension.  We add:
+
+        - **Sensor embedding** (learnable, full dim) -- analogous to
+          OLMo's channel embeddings.
+        - **Month embedding** (cyclic sin/cos, full dim) -- analogous
+          to OLMo's month encoding.
+        - **Spatial sincos** (frozen, ``_spatial_dim``) -- 2D sincos
+          from (row, col), matching OLMo's spatial encoding.
+        - **Temporal sincos** (frozen, ``_temporal_dim``) -- 1D sincos
+          from timestep index, matching OLMo's time-position encoding.
+
+        Args:
+            x: ``(B, N, D)`` decoder-space tokens.
+            sensor_ids: ``(B, N)`` sensor ID per token.
+            spatial_ids: ``(B, N, 2)`` (row, col) per token (``-1``
+                for sensor-type tokens).  ``None`` to skip spatial.
+            temporal_ids: ``(B, N)`` timestep index per token (``-1``
+                for sensor-type tokens).  ``None`` to skip temporal.
+            month_indices: ``(B, T)`` month-of-year indices.  ``None``
+                to skip month.
+
+        Returns:
+            ``(B, N, D)`` tokens with positional encodings re-added.
+        """
+        D = x.shape[-1]
+
+        # --- Sensor embedding (always available) ---
+        x = x + self.sensor_embed(sensor_ids)
+
+        # --- Month embedding (per-timestep, matching encoder logic) ---
+        if month_indices is not None and temporal_ids is not None:
+            B, T = month_indices.shape
+            month_emb = self.month_embed(month_indices)  # (B, T, D)
+
+            if T == 1:
+                x = x + month_emb
+            else:
+                mean_month = month_emb.mean(dim=1, keepdim=True)
+                t_idx = temporal_ids.clamp(min=0, max=T - 1)
+                per_token_month = torch.gather(
+                    month_emb,
+                    dim=1,
+                    index=t_idx.unsqueeze(-1).expand(-1, -1, month_emb.shape[-1]),
+                )
+                has_timestep = (temporal_ids >= 0).unsqueeze(-1)
+                per_token_month = torch.where(has_timestep, per_token_month, mean_month)
+                x = x + per_token_month
+
+        # --- Spatial sincos (2D: row + col) ---
+        # Matching OLMo-Earth's get_2d_sincos_pos_encoding_with_resolution.
+        # Each row and col position gets a 1D sincos encoding of half the
+        # spatial dim, then they are concatenated.
+        if spatial_ids is not None:
+            rows = spatial_ids[..., 0].clamp(min=0)  # (B, N)
+            cols = spatial_ids[..., 1].clamp(min=0)  # (B, N)
+            half_sp = self._spatial_dim // 2
+
+            # Resolution scaling (OLMo-Earth): scale spatial coords by
+            # gsd_ratio = (input_res * patch_size / BASE_GSD). Here, gsd
+            # is meters/pixel and BASE_GSD == 10.
+            P = patch_size or 1
+            gsd_ratio = (float(gsd) * float(P)) / 10.0
+            rows_f = rows.float() * gsd_ratio
+            cols_f = cols.float() * gsd_ratio
+
+            row_enc = self._sincos_1d(rows_f, half_sp)  # (B, N, half_sp)
+            col_enc = self._sincos_1d(cols_f, half_sp)  # (B, N, half_sp)
+            spatial_enc = torch.cat([row_enc, col_enc], dim=-1)  # (B, N, _spatial_dim)
+
+            # Zero out for sensor-type tokens (spatial_ids == -1)
+            is_type = (spatial_ids[..., 0] == -1).unsqueeze(-1)  # (B, N, 1)
+            spatial_enc = spatial_enc.where(~is_type, spatial_enc.new_zeros(1))
+
+            # Add to the first _spatial_dim dimensions of x
+            x[..., : self._spatial_dim] = x[..., : self._spatial_dim] + spatial_enc.to(x.dtype)
+
+        # --- Temporal sincos (1D: timestep index) ---
+        if temporal_ids is not None:
+            t_pos = temporal_ids.clamp(min=0)  # (B, N)
+            temporal_enc = self._sincos_1d(t_pos, self._temporal_dim)  # (B, N, _temporal_dim)
+
+            # Zero out for non-temporal tokens (temporal_ids == -1)
+            is_non_temporal = (temporal_ids == -1).unsqueeze(-1)
+            temporal_enc = temporal_enc.where(~is_non_temporal, temporal_enc.new_zeros(1))
+
+            # Add to the last _temporal_dim dimensions of x
+            x[..., D - self._temporal_dim :] = (
+                x[..., D - self._temporal_dim :] + temporal_enc.to(x.dtype)
+            )
+
+        return x
 
     def forward(
         self,
-        context: Tensor,
-        num_predictions: int,
+        all_tokens: Tensor,
+        visibility_mask: Tensor,
+        sensor_ids: Tensor | None = None,
+        spatial_ids: Tensor | None = None,
+        temporal_ids: Tensor | None = None,
+        month_indices: Tensor | None = None,
+        patch_size: int | None = None,
+        gsd: float = 10.0,
     ) -> Tensor:
-        """Decode masked positions.
+        """Decode the full token sequence.
 
         Args:
-            context: Encoder output ``(B, N_ctx, D)``.
-            num_predictions: Number of tokens to predict.
+            all_tokens: ``(B, N, D_enc)`` -- full encoder output (visible
+                positions have real representations; masked positions can
+                be anything -- they will be replaced).
+            visibility_mask: ``(B, N)`` integer mask with
+                :class:`TokenVisibility` values.  Tokens with value
+                ``VISIBLE_ENCODER`` (0) are context; tokens with value
+                ``PREDICTED`` (2) are decode targets that get replaced by
+                ``mask_token``.  All other values (``TARGET_ONLY``,
+                ``ABSENT``) are treated as neither context nor target and
+                are dropped from the attention.
+            sensor_ids: ``(B, N)`` sensor ID per token (from the
+                encoder's tokenizer).  Used for positional re-encoding.
+            spatial_ids: ``(B, N, 2)`` (row, col) per token.  Used
+                for sincos spatial re-encoding.
+            temporal_ids: ``(B, N)`` timestep index per token.  Used
+                for sincos temporal re-encoding.
+            month_indices: ``(B, T)`` month-of-year indices (0-11).
+                Used for positional re-encoding.
 
         Returns:
-            Predicted token representations ``(B, num_predictions, D)``.
+            ``(B, N, D)`` -- decoded token sequence in the **original**
+            ordering.  The caller should gather the positions it needs
+            (typically ``PREDICTED``).
         """
-        B, _, D = context.shape
+        VIS = 0   # TokenVisibility.VISIBLE_ENCODER
+        PRED = 2  # TokenVisibility.PREDICTED
 
-        if num_predictions == 0:
-            return context.new_zeros(B, 0, D)
+        B, N, D_enc = all_tokens.shape
 
-        # Initialize mask tokens
-        queries = self.mask_token.expand(B, num_predictions, -1)
+        # --- 1. Project encoder representations into decoder space ---
+        x = self.encoder_to_decoder_embed(self.input_norm(all_tokens))
+        D = x.shape[-1]
 
-        # Bidirectional: first let context attend to queries
-        enriched_context = self.context_cross_attn(
-            context, context=queries
+        # --- 2. Replace masked (PREDICTED) positions with mask_token ---
+        is_pred = (visibility_mask == PRED)  # (B, N)
+        mask_expand = is_pred.unsqueeze(-1).expand_as(x)  # (B, N, D)
+        x = torch.where(mask_expand, self.mask_token.expand_as(x), x)
+
+        # --- 3. Re-apply positional encodings to ALL tokens ---
+        # This is critical: mask tokens are position-blind learned vectors.
+        # OLMo-Earth re-applies composite_encodings after mask replacement
+        # so that mask tokens receive spatial/temporal/sensor identity.
+        if sensor_ids is not None:
+            x = self._apply_positional_reencoding(
+                x,
+                sensor_ids,
+                spatial_ids,
+                temporal_ids,
+                month_indices,
+                patch_size=patch_size,
+                gsd=gsd,
+            )
+
+        # --- 4. Sort: PREDICTED first, then VISIBLE, then inactive ---
+        is_active = (visibility_mask == VIS) | (visibility_mask == PRED)  # (B, N)
+
+        # Build a sort key: PREDICTED=2 > VISIBLE=0, inactive gets -1
+        sort_key = torch.where(is_active, visibility_mask, torch.full_like(visibility_mask, -1))
+        sorted_key, sort_indices = torch.sort(sort_key.int(), dim=1, descending=True, stable=True)
+
+        # Gather tokens in sorted order
+        idx_expand = sort_indices.unsqueeze(-1).expand(-1, -1, D)
+        x_sorted = torch.gather(x, dim=1, index=idx_expand)
+
+        # Count decode-targets and context per sample
+        max_pred = int((sorted_key == PRED).sum(dim=1).max().item())
+        max_vis = int((sorted_key == VIS).sum(dim=1).max().item())
+
+        if max_pred == 0:
+            # Nothing to decode -- return projected tokens as-is.
+            return self.norm(x)
+
+        # Split: sorted order is [PRED, VIS, inactive].
+        tokens_to_decode = x_sorted[:, :max_pred]                          # (B, max_pred, D)
+        context_tokens = (
+            x_sorted[:, max_pred : max_pred + max_vis]
+            if max_vis > 0
+            else x_sorted[:, :0]
+        )  # (B, max_vis, D)
+
+        # Cross-attention mask: each decode token can attend to valid
+        # context tokens.  Shape ``(B, 1, max_pred, max_vis)`` for
+        # broadcasting across attention heads.  ``True`` = attend.
+        cross_attn_mask: Tensor | None = None
+        if max_vis > 0:
+            context_mask = (sorted_key[:, max_pred : max_pred + max_vis] == VIS)  # (B, max_vis)
+            # (B, 1, 1, max_vis) -> broadcasts to (B, num_heads, max_pred, max_vis)
+            cross_attn_mask = context_mask[:, None, None, :].expand(-1, -1, max_pred, -1)
+
+        # --- 5. Cross-attention: decode-targets attend to context ---
+        tokens_to_decode = self.transformer(
+            tokens_to_decode,
+            context=context_tokens,
+            cross_attn_mask=cross_attn_mask,
         )
 
-        # Then let queries attend to enriched context
-        decoded = self.transformer(queries, context=enriched_context)
-        decoded = self.norm(decoded)
+        # --- 6. Recombine into original ordering ---
+        out_sorted = x_sorted.clone()
+        out_sorted[:, :max_pred] = tokens_to_decode
 
-        return decoded
+        # Unsort: scatter back to original positions
+        _, unsort_indices = sort_indices.sort(dim=1)
+        unsort_expand = unsort_indices.unsqueeze(-1).expand(-1, -1, D)
+        out = torch.gather(out_sorted, dim=1, index=unsort_expand)
+
+        out = self.norm(out)
+        return out

@@ -16,6 +16,10 @@ from spacenit.pipeline.runners.contrastive_latent import (
     ContrastiveLatentRunner,
     ContrastiveLatentRunnerConfig,
 )
+from spacenit.pipeline.runners.contrastive_latent_mim import (
+    ContrastiveLatentMIMRunner,
+    ContrastiveLatentMIMRunnerConfig,
+)
 from spacenit.pipeline.runners.dual_branch import (
     DualBranchRunner,
     DualBranchRunnerConfig,
@@ -30,6 +34,8 @@ __all__ = [
     "AutoEncoderRunnerConfig",
     "ContrastiveLatentRunner",
     "ContrastiveLatentRunnerConfig",
+    "ContrastiveLatentMIMRunner",
+    "ContrastiveLatentMIMRunnerConfig",
     "DualBranchRunner",
     "DualBranchRunnerConfig",
 ]

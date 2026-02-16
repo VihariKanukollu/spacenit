@@ -24,7 +24,9 @@ from olmo_core.train.checkpoint import CheckpointerConfig
 from olmo_core.train.common import Duration, LoadStrategy
 from olmo_core.train.config import TrainerConfig
 
+from spacenit.arch.band_tokenization import TokenizationConfig
 from spacenit.arch.common import PoolingType
+from spacenit.ingestion.augmentations import TransformConfig
 from spacenit.ingestion.sensors import (
     CDL,
     LANDSAT,
@@ -52,8 +54,8 @@ from spacenit.pipeline.hooks.downstream_eval import (
 )
 from spacenit.pipeline.hooks.throughput_monitor import SpaceNitThroughputMonitor
 from spacenit.pipeline.hooks.experiment_logger import SpaceNitExperimentLogger
-from spacenit.pipeline.runners.contrastive_latent import (
-    ContrastiveLatentRunnerConfig,
+from spacenit.pipeline.runners.contrastive_latent_mim import (
+    ContrastiveLatentMIMRunnerConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,6 +80,9 @@ def build_common_components(
         CDL.label,
         WORLDCEREAL.label,
     ]
+    # Default to sensor-spec spectral-group tokenization (matches OLMoEarth style).
+    if config.tokenization_config is None:
+        config.tokenization_config = TokenizationConfig()
     return config
 
 
@@ -105,25 +110,28 @@ def get_masking_config() -> dict:
 
 def build_train_module_config(
     common: CommonComponents,
-) -> ContrastiveLatentRunnerConfig:
+) -> ContrastiveLatentMIMRunnerConfig:
     """Build the train module config for an experiment.
 
     Args:
         common: Common experiment components.
     """
-    return ContrastiveLatentRunnerConfig(
+    return ContrastiveLatentMIMRunnerConfig(
         optim_config=AdamWConfig(lr=0.0001, weight_decay=0.02, fused=False),
         rank_microbatch_size=32,
         masking_config=get_masking_config(),
-        contrastive_temperature=0.1,
-        uniformity_weight=0.1,
+        patch_disc_tau=0.1,
+        patch_disc_weight=1.0,
+        global_contrastive_temperature=0.1,
+        global_contrastive_weight=0.1,
+        uniformity_weight=0.0,
         max_grad_norm=1.0,
         scheduler=CosWithWarmup(warmup_steps=8000),
         dp_config=DataParallelConfig(
-            name=DataParallelType.fsdp,
-            param_dtype=DType.bfloat16,
-            reduce_dtype=DType.float32,
+            name=DataParallelType.ddp,
         ),
+        find_unused_parameters=False,
+        autocast_precision=DType.bfloat16,
     )
 
 
@@ -145,8 +153,9 @@ def build_dataloader_config(
         max_patch_size=MAX_PATCH_SIZE,
         work_dir=common.save_folder,
         seed=3622,
-        # The current contrastive runner consumes a single MaskedGeoSample.
-        num_masked_views=1,
+        # Two independently augmented + masked views (contrastive LatentMIM).
+        num_masked_views=2,
+        transform_config=TransformConfig(transform_type="dihedral"),
         masking_config=get_masking_config(),
         tokenization_config=common.tokenization_config,
     )

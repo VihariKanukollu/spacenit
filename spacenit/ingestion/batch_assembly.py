@@ -135,15 +135,19 @@ def collate_double_masked_batched(
     # First, collate raw samples into a batched GeoSample
     patch_size, stacked_sample = collate_geo_tiles(batch)
 
-    # Apply transform to the batch (if configured)
+    # Apply transform independently for each view (if configured). For random
+    # transforms (e.g., dihedral), this yields two different augmentations of
+    # the same underlying batch, matching common SSL protocols.
     if transform is not None:
-        stacked_sample = transform(stacked_sample)
+        sample_a = transform(stacked_sample)
+        sample_b = transform(stacked_sample)
+    else:
+        sample_a = stacked_sample
+        sample_b = stacked_sample
 
-    # Apply both masking strategies to the batch
-    masked_sample_a = masking_strategy.apply_mask(stacked_sample, patch_size)
-    strategy_b = (
-        masking_strategy_b if masking_strategy_b is not None else masking_strategy
-    )
-    masked_sample_b = strategy_b.apply_mask(stacked_sample, patch_size)
+    # Apply masking strategies to each view.
+    masked_sample_a = masking_strategy.apply_mask(sample_a, patch_size)
+    strategy_b = masking_strategy_b if masking_strategy_b is not None else masking_strategy
+    masked_sample_b = strategy_b.apply_mask(sample_b, patch_size)
 
     return patch_size, masked_sample_a, masked_sample_b

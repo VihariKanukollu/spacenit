@@ -1,16 +1,16 @@
-"""Transformer building blocks with modern design choices.
+"""Transformer building blocks.
 
-Implements grouped-query attention (GQA), RMSNorm, SwiGLU feed-forward,
-and a post-norm transformer layer.  Uses PyTorch-native
-``scaled_dot_product_attention`` for automatic flash/memory-efficient
-dispatch.
+This file started as a "modern" post-norm + RMSNorm + SwiGLU + GQA stack.
+To match OLMo-Earth's proven recipe (90%+ EuroSAT), the default transformer
+block is now **OLMo-style**:
 
-Design choices vs. the original codebase:
-- Post-norm (residual then norm) instead of pre-norm
-- RMSNorm instead of LayerNorm
-- SwiGLU instead of GELU MLP
-- Grouped-query attention instead of standard multi-head attention
-- No stochastic depth or LayerScale
+- **Pre-norm** residual blocks (LayerNorm before attention/MLP)
+- **GELU MLP** (mlp_ratio-style) instead of SwiGLU
+- **qkv bias enabled** (matches OLMo-Earth instantiation)
+- Optional **DropPath** (stochastic depth)
+
+We keep GQA-capable attention for compatibility; when ``num_kv_heads`` is
+unset it reduces to standard multi-head attention.
 """
 
 from __future__ import annotations
@@ -191,6 +191,31 @@ class GroupedQueryAttention(nn.Module):
             v = v.unsqueeze(2).expand(-1, -1, self.num_kv_groups, -1, -1)
             v = v.reshape(B, self.num_heads, M, self.head_dim)
 
+        # Normalize attention mask shape for PyTorch SDPA.
+        #
+        # In torch>=2.7, SDPA expects an attention mask broadcastable to
+        # (B, H, N, M). A common / convenient mask shape is (B, N, M), but
+        # that does *not* broadcast correctly against (B, H, N, M) because
+        # its second dimension aligns with the head dimension.
+        #
+        # We accept:
+        # - (N, M)         : broadcast over batch + heads
+        # - (B, N, M)      : broadcast over heads
+        # - (B, 1, N, M)   : broadcast over heads
+        # - (B, H, N, M)   : per-head mask
+        if attn_mask is not None:
+            if attn_mask.ndim == 2:
+                attn_mask = attn_mask[None, None, :, :]
+            elif attn_mask.ndim == 3:
+                attn_mask = attn_mask[:, None, :, :]
+            elif attn_mask.ndim == 4:
+                pass
+            else:
+                raise ValueError(
+                    f"attn_mask must have shape (N, M), (B, N, M), or (B, H, N, M); "
+                    f"got {tuple(attn_mask.shape)}"
+                )
+
         # Use PyTorch native SDPA (auto-dispatches to flash/efficient kernels)
         drop_p = self.dropout if self.training else 0.0
         out = F.scaled_dot_product_attention(
@@ -244,29 +269,79 @@ class SwiGLUFFN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Post-Norm Transformer Layer
+# OLMo-style MLP + DropPath
+# ---------------------------------------------------------------------------
+
+
+class Mlp(nn.Module):
+    """Standard 2-layer MLP with GELU (ViT / OLMo-Earth style)."""
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int | None = None,
+        out_features: int | None = None,
+        *,
+        bias: bool = True,
+        drop: float = 0.0,
+    ) -> None:
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias)
+        self.act = nn.GELU()
+        self.drop1 = nn.Dropout(drop)
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias)
+        self.drop2 = nn.Dropout(drop)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.fc2(x)
+        x = self.drop2(x)
+        return x
+
+
+class DropPath(nn.Module):
+    """Stochastic depth per sample (Deep Networks with Stochastic Depth)."""
+
+    def __init__(self, drop_prob: float = 0.0) -> None:
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # (B, 1, 1, ...)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
+
+
+# ---------------------------------------------------------------------------
+# Transformer Layer (OLMo-style pre-norm)
 # ---------------------------------------------------------------------------
 
 
 class TransformerBlock(nn.Module):
-    """Single transformer layer with post-norm residual connections.
+    """Single transformer layer with OLMo-style pre-norm residuals.
 
-    Architecture::
-
-        x = norm(x + self_attn(x))
-        x = norm(x + ffn(x))
-
-    Optionally includes a cross-attention sub-layer between self-attention
-    and the feed-forward network.
+    Behavior matches OLMo-Earth's ``Block``:
+    - If *context* is ``None``: self-attention.
+    - If *context* is provided: cross-attention (queries attend to context),
+      and **no** self-attention is applied.
 
     Args:
         dim: Model dimension.
         num_heads: Number of query attention heads.
         num_kv_heads: Number of key/value heads for GQA.
-        ffn_expansion: Feed-forward expansion ratio.
-        dropout: Dropout probability for attention and FFN.
-        bias: Whether to use bias in linear layers.
-        cross_attention: Whether to include a cross-attention sub-layer.
+        ffn_expansion: MLP ratio (hidden = dim * ratio).
+        dropout: Dropout probability for attention and MLP.
+        bias: Whether to use bias in linear layers (qkv + MLP).
+        cross_attention: Whether the block may be used for cross-attention.
+        drop_path: Stochastic depth probability.
     """
 
     def __init__(
@@ -276,24 +351,26 @@ class TransformerBlock(nn.Module):
         num_kv_heads: int | None = None,
         ffn_expansion: float = 8 / 3,
         dropout: float = 0.0,
-        bias: bool = False,
+        bias: bool = True,
         cross_attention: bool = False,
+        drop_path: float = 0.0,
     ) -> None:
         super().__init__()
-        self.self_attn = GroupedQueryAttention(
+        self.cross_attention = cross_attention
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = GroupedQueryAttention(
             dim, num_heads, num_kv_heads, dropout=dropout, bias=bias
         )
-        self.self_attn_norm = RMSNorm(dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-        self.has_cross_attn = cross_attention
-        if cross_attention:
-            self.cross_attn = GroupedQueryAttention(
-                dim, num_heads, num_kv_heads, dropout=dropout, bias=bias
-            )
-            self.cross_attn_norm = RMSNorm(dim)
-
-        self.ffn = SwiGLUFFN(dim, expansion=ffn_expansion, dropout=dropout, bias=bias)
-        self.ffn_norm = RMSNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=int(dim * ffn_expansion),
+            out_features=dim,
+            bias=bias,
+            drop=dropout,
+        )
 
     def forward(
         self,
@@ -317,19 +394,28 @@ class TransformerBlock(nn.Module):
         Returns:
             Output tokens ``(B, N, D)``.
         """
-        # Self-attention + post-norm
-        x = self.self_attn_norm(
-            x + self.self_attn(x, rope_freqs=rope_freqs, attn_mask=self_attn_mask)
-        )
-
-        # Cross-attention + post-norm (optional)
-        if self.has_cross_attn and context is not None:
-            x = self.cross_attn_norm(
-                x + self.cross_attn(x, context=context, attn_mask=cross_attn_mask)
+        # OLMo-style: pre-norm attention, then residual.
+        if context is not None:
+            if not self.cross_attention:
+                raise ValueError("context was provided but this block was built without cross_attention=True")
+            # Cross-attention: do NOT apply RoPE to cross-attention (OLMo-Earth uses
+            # additive positional encodings, not RoPE).
+            attn_out = self.attn(
+                self.norm1(x),
+                context=context,
+                rope_freqs=None,
+                attn_mask=cross_attn_mask,
+            )
+        else:
+            attn_out = self.attn(
+                self.norm1(x),
+                context=None,
+                rope_freqs=rope_freqs,
+                attn_mask=self_attn_mask,
             )
 
-        # Feed-forward + post-norm
-        x = self.ffn_norm(x + self.ffn(x))
+        x = x + self.drop_path(attn_out)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
 
         return x
 
@@ -361,8 +447,9 @@ class TransformerStack(nn.Module):
         num_kv_heads: int | None = None,
         ffn_expansion: float = 8 / 3,
         dropout: float = 0.0,
-        bias: bool = False,
+        bias: bool = True,
         cross_attention: bool = False,
+        drop_path: float = 0.0,
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList([
@@ -374,6 +461,7 @@ class TransformerStack(nn.Module):
                 dropout=dropout,
                 bias=bias,
                 cross_attention=cross_attention,
+                drop_path=drop_path,
             )
             for _ in range(depth)
         ])

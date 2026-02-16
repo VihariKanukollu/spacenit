@@ -5,7 +5,7 @@ encodings into a single module.
 
 Design choices vs. the original codebase:
 - ``nn.Unfold`` + ``nn.Linear`` instead of ``nn.Conv2d`` for patch embedding
-- ``F.interpolate`` with area mode (not bicubic) for resolution adaptation
+- ``F.interpolate`` with bicubic + antialias for patch-size adaptation (OLMo-Earth style)
 - 2D rotary embeddings scaled by GSD for spatial positions
 - 1D rotary embeddings for temporal positions
 - Cyclic month encoding via a precomputed sin/cos lookup table
@@ -36,14 +36,17 @@ class AdaptivePatchEmbed(nn.Module):
 
     Uses ``nn.Unfold`` to extract patches and ``nn.Linear`` to project them,
     which is mathematically equivalent to ``nn.Conv2d`` but uses a different
-    code path.  Supports runtime patch-size adaptation by resizing the
-    projection weights via area-mode interpolation (FlexiViT idea).
+    code path. Supports runtime patch-size adaptation **by resizing the input
+    image** (bicubic + antialias) so we can always apply the *base* patch
+    projection weights (matching OLMo-Earth's ``FlexiPatchEmbed``).
 
     Args:
         base_patch_size: The native patch size the weights are trained for.
         in_channels: Number of input channels.
         embed_dim: Output embedding dimension.
         bias: Whether the linear projection includes bias.
+        interpolation: Interpolation mode for input resizing.
+        antialias: Whether to apply antialiasing during resizing.
     """
 
     def __init__(
@@ -52,29 +55,53 @@ class AdaptivePatchEmbed(nn.Module):
         in_channels: int,
         embed_dim: int,
         bias: bool = True,
+        interpolation: str = "bicubic",
+        antialias: bool = True,
     ) -> None:
         super().__init__()
         self.base_patch_size = base_patch_size
         self.in_channels = in_channels
         self.embed_dim = embed_dim
+        self.interpolation = interpolation
+        self.antialias = antialias
 
         flat_dim = in_channels * base_patch_size * base_patch_size
         self.proj = nn.Linear(flat_dim, embed_dim, bias=bias)
 
-    def _get_weight_for_patch_size(self, patch_size: int) -> Tensor:
-        """Adapt the projection weight matrix to a different patch size.
+    def _maybe_resize_input(self, x: Tensor, patch_size: int) -> Tensor:
+        """Resize input so base patch kernel yields the desired patch grid.
 
-        Reshapes the weight to ``(embed_dim, C, base_P, base_P)`` and
-        resizes it to ``(embed_dim, C, P, P)`` using area interpolation,
-        then flattens back.
+        For an input of shape ``(B, C, H, W)`` and requested patch size ``P``,
+        we want the output token grid to be ``(H//P, W//P)``. We therefore
+        resize the input to ``(H//P * base_P, W//P * base_P)`` and then
+        patchify with ``base_P``.
         """
-        if patch_size == self.base_patch_size:
-            return self.proj.weight
-
         P0 = self.base_patch_size
-        W = self.proj.weight.view(self.embed_dim, self.in_channels, P0, P0)
-        W = F.interpolate(W.float(), size=(patch_size, patch_size), mode="area")
-        return W.reshape(self.embed_dim, -1).to(self.proj.weight.dtype)
+        if patch_size == P0:
+            return x
+
+        B, C, H, W = x.shape
+        if H % patch_size != 0 or W % patch_size != 0:
+            raise AssertionError(
+                f"Spatial dims ({H}, {W}) must be divisible by patch_size {patch_size}"
+            )
+
+        new_h = (H // patch_size) * P0
+        new_w = (W // patch_size) * P0
+        if new_h == H and new_w == W:
+            return x
+
+        # Bicubic interpolation is not consistently implemented for bfloat16
+        # across backends; interpolate in float32, then cast back.
+        orig_dtype = x.dtype
+        x_f32 = x.float()
+        x_resized = F.interpolate(
+            x_f32,
+            size=(new_h, new_w),
+            mode=self.interpolation,
+            antialias=self.antialias,
+        )
+        return x_resized.to(dtype=orig_dtype)
 
     def forward(self, x: Tensor, patch_size: int | None = None) -> Tensor:
         """Patchify and embed.
@@ -89,17 +116,18 @@ class AdaptivePatchEmbed(nn.Module):
         """
         P = patch_size or self.base_patch_size
         B, C, H, W = x.shape
-        assert H % P == 0 and W % P == 0, (
-            f"Spatial dims ({H}, {W}) must be divisible by patch_size {P}"
-        )
 
-        # Unfold into patches: (B, C*P*P, num_patches)
-        patches = F.unfold(x, kernel_size=P, stride=P)
-        # -> (B, num_patches, C*P*P)
+        # OLMo-Earth style: resize input so we can always patchify at base_P.
+        x = self._maybe_resize_input(x, patch_size=P)
+        P0 = self.base_patch_size
+
+        # Unfold into patches at the base patch size: (B, C*P0*P0, num_patches)
+        patches = F.unfold(x, kernel_size=P0, stride=P0)
+        # -> (B, num_patches, C*P0*P0)
         patches = patches.transpose(1, 2)
 
-        # Project with (possibly resized) weight
-        weight = self._get_weight_for_patch_size(P)
+        # Project with base weights (no weight resizing).
+        weight = self.proj.weight
         bias = self.proj.bias
         # If the model is wrapped with DTensor-based parallelism (e.g. FSDP),
         # parameters may be DTensors while inputs are regular tensors in some

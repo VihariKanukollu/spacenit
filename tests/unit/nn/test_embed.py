@@ -41,15 +41,22 @@ class TestAdaptivePatchEmbed:
         # 64/8 = 8 patches per dim, 8*8 = 64 patches
         assert tokens.shape == (2, 64, 64)
 
-    def test_weight_adaptation(self):
-        """Adapted weights should have different flat dim than base."""
+    def test_input_resize_adaptation(self):
+        """Patch-size adaptation should resize inputs, not weights (OLMo style)."""
         embed = AdaptivePatchEmbed(
             base_patch_size=16, in_channels=3, embed_dim=64
         )
-        base_weight = embed._get_weight_for_patch_size(16)
-        adapted_weight = embed._get_weight_for_patch_size(8)
-        assert base_weight.shape[1] == 3 * 16 * 16  # 768
-        assert adapted_weight.shape[1] == 3 * 8 * 8  # 192
+        x = torch.randn(2, 3, 64, 64)
+
+        # Requested patch_size=8 should upsample to (H//8)*16 = 128 before unfolding.
+        x_resized = embed._maybe_resize_input(x, patch_size=8)
+        assert x_resized.shape == (2, 3, 128, 128)
+
+        # Weights stay at base patch size.
+        assert embed.proj.weight.shape[1] == 3 * 16 * 16  # 768
+
+        tokens = embed(x, patch_size=8)
+        assert tokens.shape == (2, 64, 64)
 
     def test_non_square_input(self):
         embed = AdaptivePatchEmbed(

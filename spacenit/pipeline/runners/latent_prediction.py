@@ -173,6 +173,11 @@ class LatentPredictionRunner(SpaceNitTrainRunner):
             dry_run: If ``True``, skip metric recording.
         """
         self.model.train()
+
+        # EMA update BEFORE forward pass (matching OLMo-Earth).
+        if not dry_run and hasattr(self.model, "step_ema"):
+            self.model.step_ema()
+
         total_loss = torch.zeros([], device=self.device)
         patch_size = batch[0]
         batch_data = batch[1]
@@ -226,10 +231,6 @@ class LatentPredictionRunner(SpaceNitTrainRunner):
 
                 loss.backward()
                 total_loss += get_local_tensor(loss.detach())
-
-        # EMA update (delegated to model)
-        if not dry_run and hasattr(self.model, "step_ema"):
-            self.model.step_ema()
 
         # Log metrics
         if not dry_run:

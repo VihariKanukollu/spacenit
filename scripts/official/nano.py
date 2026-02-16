@@ -17,6 +17,7 @@ from script import (  # noqa: E402
     build_dataset_config,
     build_train_module_config,
     build_trainer_config,
+    MAX_PATCH_SIZE,
 )
 
 from spacenit.arch.encoder import EncoderConfig
@@ -37,10 +38,22 @@ def build_model_config(common: CommonComponents) -> LatentPredictorConfig:
             num_heads=model_size["encoder_num_heads"],
             depth=model_size["encoder_depth"],
             ffn_expansion=model_size["mlp_ratio"],
+            drop_path=0.1,
+            # Must match the dataloader's max_patch_size (and OLMo-Earth).
+            base_patch_size=MAX_PATCH_SIZE,
             sensor_labels=common.training_modalities,
+            tokenization_config=common.tokenization_config,
         ),
         decoder_depth=model_size["decoder_depth"],
         decoder_num_heads=model_size["decoder_num_heads"],
+        # Frozen target encoder (matching OLMo-Earth's ema_decay=(1.0, 1.0)).
+        # The target encoder stays at its initial random weights, providing
+        # a fixed prediction target.  This prevents the collapse feedback
+        # loop that occurs with a slowly-tracking EMA target.
+        ema_momentum=1.0,
+        ema_momentum_end=1.0,
+        # Match OLMo-Earth: contrastive projection dim equals encoder dim.
+        projection_dim=model_size["encoder_embedding_size"],
     )
 
 

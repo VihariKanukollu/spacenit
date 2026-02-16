@@ -151,6 +151,77 @@ class ContrastiveLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Patch Discrimination Loss (token-level InfoNCE)
+# ---------------------------------------------------------------------------
+
+
+class PatchDiscriminationLoss(nn.Module):
+    """Token-level discrimination loss (OLMoEarth-style).
+
+    Given per-token predictions and targets of shape ``(B, N, D)``, each
+    prediction token must identify its matching target token among the
+    ``N`` targets **within the same sample**. This is a contrastive
+    classification loss over the similarity matrix.
+
+    This matches the ``PatchDiscriminationLossNew`` in
+    ``olmoearth_pretrain``, including optional ``pred2unit`` batch
+    standardization and per-sample loss averaging for variable token
+    counts.
+
+    Args:
+        tau: Softmax temperature.
+        pred2unit: If ``True``, standardize predictions using per-sample
+            batch statistics before L2 normalization (matching
+            OLMo-Earth's ``pred2unit`` option).
+    """
+
+    def __init__(self, tau: float = 0.1, pred2unit: bool = False) -> None:
+        super().__init__()
+        self.tau = float(tau)
+        self.pred2unit = bool(pred2unit)
+
+    def forward(self, predictions: Tensor, targets: Tensor) -> Tensor:
+        # predictions/targets: (B, N, D)
+        if predictions.ndim != 3 or targets.ndim != 3:
+            raise ValueError(
+                f"Expected predictions/targets to be 3D, got "
+                f"{predictions.shape=} {targets.shape=}"
+            )
+        if predictions.shape[:2] != targets.shape[:2]:
+            raise ValueError(
+                "Predictions and targets must align on (B, N), got "
+                f"{predictions.shape=} {targets.shape=}"
+            )
+        B, N, _ = predictions.shape
+        if N == 0 or B == 0:
+            return predictions.new_zeros([])
+
+        pred = predictions
+        tgt = targets
+
+        # Optional batch standardization (OLMo-Earth pred2unit)
+        if self.pred2unit:
+            pred_mu = pred.mean(dim=1, keepdim=True)
+            pred_std = pred.std(dim=1, keepdim=True)
+            pred = (pred - pred_mu) / (pred_std + 1e-4)
+
+        pred = F.normalize(pred, p=2, dim=-1)
+        tgt = F.normalize(tgt, p=2, dim=-1)
+
+        # Per-sample loss (matching OLMo-Earth's per-sample averaging)
+        losses: list[Tensor] = []
+        for b in range(B):
+            scores_b = torch.einsum("nd,md->nm", pred[b], tgt[b]) / self.tau
+            labels_b = torch.arange(N, device=pred.device, dtype=torch.long)
+            loss_b = F.cross_entropy(scores_b, labels_b, reduction="none")
+            # Scale by tau * 2 (matching OLMo-Earth)
+            loss_b = loss_b * (self.tau * 2.0)
+            losses.append(loss_b.mean())
+
+        return torch.stack(losses).mean()
+
+
+# ---------------------------------------------------------------------------
 # Reconstruction Loss
 # ---------------------------------------------------------------------------
 

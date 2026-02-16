@@ -262,30 +262,44 @@ class DownstreamEvalRunner:
         print(
             f"Getting embeddings for {self.dataset} with norm method {self.norm_method}"
         )
-        # Representation source for evaluation:
-        # - If we have a full SSL model with an EMA target branch (e.g. LatentPredictor),
-        #   pass the full model to the benchmark adapter so it can choose the most
-        #   appropriate representation (often the target/projection features).
-        # - Otherwise, fall back to using an `encoder` submodule when present.
+        # Representation source for evaluation.
+        #
+        # Default (matching OLMo-Earth): use the **online encoder** and mean-pool
+        # its raw token embeddings.  Projection-head features are optimised for
+        # the contrastive objective and typically transfer *worse* to downstream
+        # KNN / linear-probe tasks (well-known in SimCLR / BYOL / DINO
+        # literature).
+        #
+        # Override via SPACENIT_EVAL_REPRESENTATION env-var:
+        #   "proj"             -> full model, projection-head features
+        #   "target_encoder"   -> EMA encoder raw tokens
+        #   "encoder"          -> online encoder raw tokens (the default)
         train_model = self.trainer.train_module.model
         rep = os.getenv("SPACENIT_EVAL_REPRESENTATION", "").strip().lower()
-        # Default to evaluating the encoder/backbone features (closer to common
-        # SSL/GeoBench protocols). You can override via SPACENIT_EVAL_REPRESENTATION:
-        # - "proj": use LatentPredictor projections (target_proj/online_proj)
-        # - "target_encoder"/"ema": use the momentum encoder tokens
-        # - "encoder"/"backbone": use the online encoder tokens
-        if rep in {"proj", "projection"} and hasattr(train_model, "target_encoder") and hasattr(
-            train_model, "target_proj"
-        ):
+
+        if rep in {"proj", "projection"} and hasattr(train_model, "target_encoder") and hasattr(train_model, "target_proj"):
+            # Explicitly requested projection-head features.
             model = train_model
         elif rep in {"target_encoder", "ema"} and hasattr(train_model, "target_encoder"):
             model = train_model.target_encoder
+        elif rep in {"encoder", "backbone"}:
+            # Explicitly requested online encoder.
+            if hasattr(train_model, "encoder"):
+                model = train_model.encoder
+            else:
+                model = train_model
         elif hasattr(train_model, "encoder"):
+            # Default: online encoder raw tokens, mean-pooled (matches OLMo-Earth).
             model = train_model.encoder
         elif hasattr(train_model, "target_encoder"):
             model = train_model.target_encoder
         else:
             model = train_model
+
+        logger.info(
+            f"Downstream eval representation='{rep or 'default'}' "
+            f"-> model={type(model).__name__}"
+        )
 
         # Unwrap DDP wrapper for adapter type checks. Do NOT unwrap FSDP, since
         # FSDP's wrapper is responsible for unsharding parameters on forward.

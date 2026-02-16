@@ -29,6 +29,7 @@ from spacenit.pipeline.losses import (
     CompositeLoss,
     ContrastiveLoss,
     LatentPredictionLoss,
+    PatchDiscriminationLoss,
     ReconstructionLoss,
     UniformityLoss,
 )
@@ -91,6 +92,28 @@ def _make_latent_config(labels: list[str]) -> LatentPredictorConfig:
     )
 
 
+def _make_visibility_mask(
+    N_total: int,
+    B: int = BATCH,
+    encode_ratio: float = 0.5,
+) -> torch.Tensor:
+    """Create a random visibility mask with VISIBLE_ENCODER (0) and PREDICTED (2).
+
+    ``encode_ratio`` fraction of tokens are visible; the rest are predicted.
+    """
+    VIS = 0   # TokenVisibility.VISIBLE_ENCODER
+    PRED = 2  # TokenVisibility.PREDICTED
+
+    N_vis = max(1, int(N_total * encode_ratio))
+    masks = []
+    for _ in range(B):
+        perm = torch.randperm(N_total)
+        m = torch.full((N_total,), PRED, dtype=torch.long)
+        m[perm[:N_vis]] = VIS
+        masks.append(m)
+    return torch.stack(masks)
+
+
 # ---------------------------------------------------------------------------
 # 1. Model construction
 # ---------------------------------------------------------------------------
@@ -151,7 +174,7 @@ class TestEncoderForward:
         encoder = _make_encoder_config(labels).build()
         sensor_data = _make_sensor_data(labels)
 
-        encoded, sensor_ids, layout = encoder(sensor_data)
+        encoded, sensor_ids, spatial_ids, temporal_ids, layout = encoder(sensor_data)
 
         assert encoded.ndim == 3
         assert encoded.shape[0] == BATCH
@@ -166,7 +189,7 @@ class TestEncoderForward:
         encoder = _make_encoder_config(labels).build()
         sensor_data = _make_sensor_data(labels)
 
-        encoded, sensor_ids, layout = encoder(sensor_data)
+        encoded, sensor_ids, spatial_ids, temporal_ids, layout = encoder(sensor_data)
 
         assert encoded.shape[0] == BATCH
         assert encoded.shape[2] == EMBED
@@ -178,7 +201,7 @@ class TestEncoderForward:
         sensor_data = _make_sensor_data(labels)
 
         # First do unmasked to get total token count
-        full_enc, _, _ = encoder(sensor_data)
+        full_enc, _, _, _, _ = encoder(sensor_data)
         N_total = full_enc.shape[1]
 
         # Keep half the tokens
@@ -187,7 +210,7 @@ class TestEncoderForward:
             torch.randperm(N_total)[:N_keep] for _ in range(BATCH)
         ])
 
-        masked_enc, masked_ids, _ = encoder(sensor_data, mask_indices=mask_indices)
+        masked_enc, masked_ids, _, _, _ = encoder(sensor_data, mask_indices=mask_indices)
         assert masked_enc.shape == (BATCH, N_keep, EMBED)
 
 
@@ -208,25 +231,17 @@ class TestLatentPredictorForward:
 
         # Get total token count
         with torch.no_grad():
-            full_enc, _, _ = model.encoder(sensor_data)
+            full_enc, _, _, _, _ = model.encoder(sensor_data)
         N_total = full_enc.shape[1]
 
-        # Split into visible and target indices
-        N_vis = max(1, N_total // 2)
-        N_tgt = N_total - N_vis
-
-        visible_indices = torch.stack([
-            torch.randperm(N_total)[:N_vis] for _ in range(BATCH)
-        ])
-        target_indices = torch.stack([
-            torch.randperm(N_total)[:N_tgt] for _ in range(BATCH)
-        ])
+        # Build a visibility mask: half visible, half predicted
+        vmask = _make_visibility_mask(N_total, B=BATCH, encode_ratio=0.5)
+        N_tgt = int((vmask == 2).sum(dim=1)[0].item())
 
         with torch.no_grad():
             outputs = model(
                 sensor_data,
-                visible_indices=visible_indices,
-                target_indices=target_indices,
+                visibility_mask=vmask,
                 patch_size=PATCH,
             )
 
@@ -239,6 +254,7 @@ class TestLatentPredictorForward:
         assert "targets" in outputs
         assert "online_proj" in outputs
         assert "target_proj" in outputs
+        assert "encoder_pooled" in outputs
 
     def test_output_shapes(self):
         labels = _sensor_labels(1)
@@ -247,9 +263,10 @@ class TestLatentPredictorForward:
         assert outputs["targets"].shape == (BATCH, N_tgt, EMBED)
         assert outputs["online_proj"].shape == (BATCH, N_tgt, PROJ_DIM)
         assert outputs["target_proj"].shape == (BATCH, N_tgt, PROJ_DIM)
+        assert outputs["encoder_pooled"].shape == (BATCH, EMBED)
 
-    def test_no_indices_forward(self):
-        """Forward without explicit visible/target indices."""
+    def test_no_mask_forward(self):
+        """Forward without a visibility mask (all tokens visible)."""
         labels = _sensor_labels(1)
         config = _make_latent_config(labels)
         model = config.build().to(DEVICE)
@@ -259,7 +276,6 @@ class TestLatentPredictorForward:
         with torch.no_grad():
             outputs = model(sensor_data, patch_size=PATCH)
 
-        # Without target_indices, targets = full target_encoded
         assert "predictions" in outputs
         assert "targets" in outputs
 
@@ -282,22 +298,14 @@ class TestBackwardPass:
 
         # Get token count
         with torch.no_grad():
-            full_enc, _, _ = model.encoder(sensor_data)
+            full_enc, _, _, _, _ = model.encoder(sensor_data)
         N_total = full_enc.shape[1]
-        N_vis = max(1, N_total // 2)
-        N_tgt = N_total - N_vis
 
-        visible_indices = torch.stack([
-            torch.randperm(N_total)[:N_vis] for _ in range(BATCH)
-        ])
-        target_indices = torch.stack([
-            torch.randperm(N_total)[:N_tgt] for _ in range(BATCH)
-        ])
+        vmask = _make_visibility_mask(N_total, B=BATCH, encode_ratio=0.5)
 
         outputs = model(
             sensor_data,
-            visible_indices=visible_indices,
-            target_indices=target_indices,
+            visibility_mask=vmask,
             patch_size=PATCH,
         )
 
@@ -306,8 +314,6 @@ class TestBackwardPass:
         loss.backward()
 
         # Check gradients exist on online encoder params (not target encoder).
-        # Some params (e.g. month_embed) won't have gradients if their
-        # corresponding input wasn't provided -- that's expected.
         has_any_grad = False
         for name, p in model.encoder.named_parameters():
             if p.grad is not None:
@@ -447,22 +453,14 @@ class TestTrainingLoop:
 
             # Get token count
             with torch.no_grad():
-                full_enc, _, _ = model.encoder(sensor_data)
+                full_enc, _, _, _, _ = model.encoder(sensor_data)
             N_total = full_enc.shape[1]
-            N_vis = max(1, N_total // 2)
-            N_tgt = max(1, N_total - N_vis)
 
-            visible_indices = torch.stack([
-                torch.randperm(N_total)[:N_vis] for _ in range(BATCH)
-            ])
-            target_indices = torch.stack([
-                torch.randperm(N_total)[:N_tgt] for _ in range(BATCH)
-            ])
+            vmask = _make_visibility_mask(N_total, B=BATCH, encode_ratio=0.5)
 
             outputs = model(
                 sensor_data,
-                visible_indices=visible_indices,
-                target_indices=target_indices,
+                visibility_mask=vmask,
                 patch_size=PATCH,
             )
 
@@ -510,22 +508,14 @@ class TestTrainingLoop:
             sensor_data = _make_sensor_data(labels)
 
             with torch.no_grad():
-                full_enc, _, _ = model.encoder(sensor_data)
+                full_enc, _, _, _, _ = model.encoder(sensor_data)
             N_total = full_enc.shape[1]
-            N_vis = max(1, N_total // 2)
-            N_tgt = max(1, N_total - N_vis)
 
-            visible_indices = torch.stack([
-                torch.randperm(N_total)[:N_vis] for _ in range(BATCH)
-            ])
-            target_indices = torch.stack([
-                torch.randperm(N_total)[:N_tgt] for _ in range(BATCH)
-            ])
+            vmask = _make_visibility_mask(N_total, B=BATCH, encode_ratio=0.5)
 
             outputs = model(
                 sensor_data,
-                visible_indices=visible_indices,
-                target_indices=target_indices,
+                visibility_mask=vmask,
                 patch_size=PATCH,
             )
 
@@ -553,7 +543,7 @@ class TestEvalForward:
         sensor_data = _make_sensor_data(labels, B=1)
 
         with torch.no_grad():
-            encoded, sensor_ids, layout = encoder(sensor_data)
+            encoded, sensor_ids, _spatial_ids, _temporal_ids, layout = encoder(sensor_data)
 
         # Features should be finite
         assert torch.isfinite(encoded).all()
@@ -570,7 +560,7 @@ class TestEvalForward:
 
         with torch.no_grad():
             # Use encoder directly for feature extraction (eval mode)
-            encoded, sensor_ids, layout = model.encoder(sensor_data)
+            encoded, sensor_ids, _spatial_ids, _temporal_ids, layout = model.encoder(sensor_data)
 
         assert torch.isfinite(encoded).all()
 
@@ -592,24 +582,24 @@ class TestEvalForward:
 
         sensor_data = _make_sensor_data(labels, B=1)
 
-        # PixelHead uses F.fold to reconstruct spatial output, so
-        # num_masked must equal the spatial patch grid: (H/P) * (W/P).
-        N_spatial = (H // PATCH) * (W // PATCH)  # 4 for 16x16 with patch=8
-
-        # Get total tokens to create visible/masked split
+        # PixelHead uses F.fold to reconstruct spatial output, so the
+        # number of PREDICTED tokens must equal the spatial patch grid:
+        # (H/P) * (W/P).  Build a visibility mask that marks exactly
+        # that many tokens as PREDICTED.
         with torch.no_grad():
-            full_enc, _, _ = model.encoder(sensor_data)
+            full_enc, _, _, _, _ = model.encoder(sensor_data)
         N_total = full_enc.shape[1]
-        N_vis = max(1, N_total - N_spatial)
+        N_spatial = (H // PATCH) * (W // PATCH)  # 4 for 16x16 with patch=8
+        N_vis = N_total - N_spatial
 
-        visible_indices = torch.randperm(N_total)[:N_vis].unsqueeze(0)
-        masked_indices = torch.arange(N_spatial).unsqueeze(0)
+        # First N_vis tokens visible, last N_spatial predicted
+        vmask = torch.zeros(1, N_total, dtype=torch.long)
+        vmask[:, N_vis:] = 2  # PREDICTED
 
         with torch.no_grad():
             outputs = model(
                 sensor_data,
-                visible_indices=visible_indices,
-                masked_indices=masked_indices,
+                visibility_mask=vmask,
                 patch_size=PATCH,
                 height=H,
                 width=W,
@@ -670,22 +660,14 @@ class TestMultiSensorTraining:
         sensor_data = _make_sensor_data(labels)
 
         with torch.no_grad():
-            full_enc, _, _ = model.encoder(sensor_data)
+            full_enc, _, _, _, _ = model.encoder(sensor_data)
         N_total = full_enc.shape[1]
-        N_vis = max(1, N_total // 2)
-        N_tgt = max(1, N_total - N_vis)
 
-        visible_indices = torch.stack([
-            torch.randperm(N_total)[:N_vis] for _ in range(BATCH)
-        ])
-        target_indices = torch.stack([
-            torch.randperm(N_total)[:N_tgt] for _ in range(BATCH)
-        ])
+        vmask = _make_visibility_mask(N_total, B=BATCH, encode_ratio=0.5)
 
         outputs = model(
             sensor_data,
-            visible_indices=visible_indices,
-            target_indices=target_indices,
+            visibility_mask=vmask,
             patch_size=PATCH,
         )
 
@@ -700,3 +682,101 @@ class TestMultiSensorTraining:
                 for p in embed_module.parameters()
             )
             assert has_grad, f"No gradient for patch_embeds[{label}]"
+
+
+# ---------------------------------------------------------------------------
+# 11. LatentMIM training loop (patch discrimination + contrastive)
+# ---------------------------------------------------------------------------
+
+
+class TestLatentMIMTraining:
+    """Simulate the OLMo-Earth-style training recipe with two views."""
+
+    def test_patch_discrimination_loss(self):
+        """PatchDiscriminationLoss produces finite, positive loss."""
+        loss_fn = PatchDiscriminationLoss(tau=0.1)
+        pred = torch.randn(BATCH, 10, EMBED)
+        tgt = torch.randn(BATCH, 10, EMBED)
+        loss = loss_fn(pred, tgt)
+        assert loss.ndim == 0
+        assert loss.item() > 0
+        assert torch.isfinite(loss)
+
+    def test_patch_discrimination_empty(self):
+        """PatchDiscriminationLoss handles zero-token case."""
+        loss_fn = PatchDiscriminationLoss(tau=0.1)
+        pred = torch.randn(BATCH, 0, EMBED)
+        tgt = torch.randn(BATCH, 0, EMBED)
+        loss = loss_fn(pred, tgt)
+        assert loss.ndim == 0
+
+    def test_two_view_mim_training(self):
+        """Full two-view MIM training loop: patch disc + InfoNCE on encoder pooled."""
+        labels = _sensor_labels(1)
+        config = _make_latent_config(labels)
+        model = config.build().to(DEVICE)
+        model.train()
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        patch_disc_fn = PatchDiscriminationLoss(tau=0.1)
+        contrastive_fn = ContrastiveLoss(initial_temperature=0.1)
+
+        losses = []
+        for step in range(3):
+            optimizer.zero_grad()
+
+            sensor_data = _make_sensor_data(labels)
+
+            # Get token count
+            with torch.no_grad():
+                full_enc, _, _, _, _ = model.encoder(sensor_data)
+            N_total = full_enc.shape[1]
+
+            # Two independent visibility masks (simulating two views)
+            vmask_a = _make_visibility_mask(N_total, B=BATCH, encode_ratio=0.5)
+            vmask_b = _make_visibility_mask(N_total, B=BATCH, encode_ratio=0.5)
+
+            # Forward view A
+            out_a = model(
+                sensor_data,
+                visibility_mask=vmask_a,
+                patch_size=PATCH,
+            )
+
+            # Forward view B
+            out_b = model(
+                sensor_data,
+                visibility_mask=vmask_b,
+                patch_size=PATCH,
+            )
+
+            # Patch discrimination on raw decoder output vs target encoder
+            mim_a = patch_disc_fn(out_a["predictions"], out_a["targets"])
+            mim_b = patch_disc_fn(out_b["predictions"], out_b["targets"])
+            mim_loss = 0.5 * (mim_a + mim_b)
+
+            # InfoNCE between mean-pooled encoder outputs of the two views
+            pooled_a = F.normalize(out_a["encoder_pooled"], dim=-1)
+            pooled_b = F.normalize(out_b["encoder_pooled"], dim=-1)
+            con_loss = contrastive_fn(pooled_a, pooled_b)
+
+            total_loss = mim_loss + 0.1 * con_loss
+            total_loss.backward()
+
+            # Check no NaN gradients
+            for name, p in model.named_parameters():
+                if p.grad is not None:
+                    assert not torch.isnan(p.grad).any(), f"NaN grad at {name}"
+
+            optimizer.step()
+            model.step_ema()
+            losses.append(total_loss.item())
+
+        assert all(not (l != l) for l in losses), "NaN loss detected"
+        assert len(losses) == 3
+
+        # Verify decoder got gradients (it's no longer frozen)
+        has_decoder_grad = any(
+            p.grad is not None for p in model.decoder.parameters()
+        )
+        assert has_decoder_grad, "Decoder should receive gradients in MIM training"

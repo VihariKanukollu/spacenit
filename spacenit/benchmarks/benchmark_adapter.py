@@ -117,6 +117,33 @@ def _pool_tokens(
         raise ValueError(f"Unknown pooling type: {pooling_type}")
 
 
+def _pool_patch_tokens_only(
+    tokens: torch.Tensor,
+    spatial_ids: torch.Tensor | None,
+    pooling_type: str,
+    *,
+    spatial_pool: bool = False,
+) -> torch.Tensor:
+    """Pool tokens while excluding per-sensor type tokens.
+
+    SpaceNit's tokenizer prepends a sensor-type token per sensor with
+    ``spatial_ids == (-1, -1)``. OLMo-Earth does not have these tokens, so
+    for downstream evaluation we pool over patch tokens only.
+    """
+    if spatial_pool or spatial_ids is None:
+        return _pool_tokens(tokens, pooling_type, spatial_pool=spatial_pool)
+
+    is_patch = spatial_ids[..., 0] != -1  # (B, N)
+    if pooling_type == PoolingType.MEAN:
+        denom = is_patch.sum(dim=1).clamp(min=1).unsqueeze(-1)  # (B, 1)
+        return (tokens * is_patch.unsqueeze(-1)).sum(dim=1) / denom
+    elif pooling_type == PoolingType.MAX:
+        masked = tokens.masked_fill(~is_patch.unsqueeze(-1), float("-inf"))
+        return masked.max(dim=1).values
+    else:
+        raise ValueError(f"Unknown pooling type: {pooling_type}")
+
+
 class SpaceNitBenchmarkAdapter(BenchmarkAdapter):
     """Adapter for SpaceNit models (Encoder, LatentPredictor, etc.)."""
 
@@ -128,15 +155,23 @@ class SpaceNitBenchmarkAdapter(BenchmarkAdapter):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass through the model, then return pooled features.
 
-        For :class:`~spacenit.arch.models.LatentPredictor` (SSL w/ EMA target),
-        we prefer the *contrastive projection* features for classification KNN /
-        probing, since that's the representation directly optimized by the
-        contrastive objective. For segmentation tasks, we still return tokens.
+        Default behaviour (matching OLMo-Earth): run the **encoder** on the
+        input and mean-pool the raw token embeddings.  This works whether
+        ``self.model`` is a bare :class:`Encoder` or a composite model that
+        has an ``.encoder`` attribute.
+
+        When the caller explicitly passes a full
+        :class:`~spacenit.arch.models.LatentPredictor` (e.g. via
+        ``SPACENIT_EVAL_REPRESENTATION=proj``), we use the contrastive
+        projection features instead.  Projection-head features are optimised
+        for the contrastive loss and often transfer worse to downstream
+        KNN / linear-probe tasks.
         """
         sensor_data = _extract_sensor_data(sample)
 
         # ------------------------------------------------------------
-        # LatentPredictor: use contrastive projection for classification
+        # LatentPredictor passed explicitly: projection-head features
+        # (only reached when SPACENIT_EVAL_REPRESENTATION=proj)
         # ------------------------------------------------------------
         if isinstance(self.model, LatentPredictor) and not self.spatial_pool:
             month_indices = None
@@ -154,20 +189,26 @@ class SpaceNitBenchmarkAdapter(BenchmarkAdapter):
                 month_indices=month_indices,
                 contrastive_only=True,
             )
-            # Use the EMA/target branch by default; it's typically more stable.
             features = outputs.get("target_proj", outputs["online_proj"])
             return features, labels
 
         # ------------------------------------------------------------
-        # Encoder-style: pool token embeddings
+        # Default: raw encoder tokens, mean-pooled (matches OLMo-Earth)
         # ------------------------------------------------------------
         encoder = self.model
         if hasattr(self.model, "encoder"):
             encoder = self.model.encoder
 
-        encoded, sensor_ids, layout = encoder(sensor_data, patch_size=self.patch_size)
+        encoded, _sensor_ids, spatial_ids, _temporal_ids, _layout = encoder(
+            sensor_data, patch_size=self.patch_size
+        )
 
-        batch_features = _pool_tokens(encoded, self.pooling_type, spatial_pool=self.spatial_pool)
+        batch_features = _pool_patch_tokens_only(
+            encoded,
+            spatial_ids,
+            self.pooling_type,
+            spatial_pool=self.spatial_pool,
+        )
         return batch_features, labels
 
 

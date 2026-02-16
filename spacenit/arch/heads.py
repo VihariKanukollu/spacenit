@@ -165,17 +165,21 @@ class PoolingHead(nn.Module):
         )
         self.norm = RMSNorm(embed_dim)
 
-    def forward(self, tokens: Tensor) -> Tensor:
+    def forward(self, tokens: Tensor, *, attn_mask: Tensor | None = None) -> Tensor:
         """Pool a token sequence into a single vector.
 
         Args:
             tokens: ``(B, N, D)`` token sequence.
+            attn_mask: Optional boolean mask of shape ``(B, 1, N)`` or
+                ``(B, N_query, N_ctx)`` where ``True`` means the query may
+                attend to that context token. When ``None``, attends to all
+                tokens.
 
         Returns:
             Pooled representation ``(B, D)``.
         """
         B = tokens.shape[0]
         query = self.query.expand(B, -1, -1)  # (B, 1, D)
-        pooled = self.cross_attn(query, context=tokens)  # (B, 1, D)
+        pooled = self.cross_attn(query, context=tokens, attn_mask=attn_mask)  # (B, 1, D)
         pooled = self.norm(pooled)
         return pooled.squeeze(1)  # (B, D)

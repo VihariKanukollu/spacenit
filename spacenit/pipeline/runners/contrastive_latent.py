@@ -121,6 +121,11 @@ class ContrastiveLatentRunner(SpaceNitTrainRunner):
             raise TypeError("train_batch received None batch")
 
         self.model.train()
+
+        # EMA update BEFORE forward pass (matching OLMo-Earth).
+        if not dry_run and hasattr(self.model, "step_ema"):
+            self.model.step_ema()
+
         total_loss = torch.zeros([], device=self.device)
         patch_size, batch_data = batch
 
@@ -176,10 +181,6 @@ class ContrastiveLatentRunner(SpaceNitTrainRunner):
 
                 loss.backward()
                 total_loss += get_local_tensor(loss.detach())
-
-        # EMA update
-        if not dry_run and hasattr(self.model, "step_ema"):
-            self.model.step_ema()
 
         if not dry_run:
             self.trainer.record_metric(

@@ -97,7 +97,7 @@ class TestEncoder:
         C = spec.total_channels
         sensor_data = {labels[0]: torch.randn(2, C, 16, 16)}
 
-        encoded, sensor_ids, layout = encoder(sensor_data)
+        encoded, sensor_ids, spatial_ids, temporal_ids, layout = encoder(sensor_data)
 
         assert encoded.shape[0] == 2
         assert encoded.shape[2] == 64
@@ -120,7 +120,7 @@ class TestEncoder:
 
         # Keep only 3 out of 5 tokens
         mask_indices = torch.tensor([[0, 1, 2], [1, 3, 4]])
-        encoded, sensor_ids, layout = encoder(
+        encoded, sensor_ids, spatial_ids, temporal_ids, layout = encoder(
             sensor_data, mask_indices=mask_indices
         )
 
@@ -143,7 +143,7 @@ class TestEncoder:
         x = torch.randn(1, C, 8, 8, requires_grad=True)
         sensor_data = {labels[0]: x}
 
-        encoded, _, _ = encoder(sensor_data)
+        encoded, _, _, _, _ = encoder(sensor_data)
         encoded.sum().backward()
         assert x.grad is not None
 
@@ -151,19 +151,25 @@ class TestEncoder:
 class TestDecoder:
     def test_forward_shape(self):
         decoder = Decoder(embed_dim=64, depth=2, num_heads=4)
-        context = torch.randn(2, 10, 64)
-        decoded = decoder(context, num_predictions=5)
-        assert decoded.shape == (2, 5, 64)
+        all_tokens = torch.randn(2, 10, 64)
+        # 5 visible, 5 predicted
+        vmask = torch.tensor([[0, 0, 0, 0, 0, 2, 2, 2, 2, 2]] * 2)
+        decoded = decoder(all_tokens, vmask)
+        assert decoded.shape == (2, 10, 64)
 
     def test_zero_predictions(self):
         decoder = Decoder(embed_dim=64, depth=2, num_heads=4)
-        context = torch.randn(2, 10, 64)
-        decoded = decoder(context, num_predictions=0)
-        assert decoded.shape == (2, 0, 64)
+        all_tokens = torch.randn(2, 10, 64)
+        # All visible, nothing to predict
+        vmask = torch.zeros(2, 10, dtype=torch.long)
+        decoded = decoder(all_tokens, vmask)
+        assert decoded.shape == (2, 10, 64)
 
     def test_gradient_flows(self):
         decoder = Decoder(embed_dim=32, depth=1, num_heads=4)
-        context = torch.randn(2, 8, 32, requires_grad=True)
-        decoded = decoder(context, num_predictions=4)
+        all_tokens = torch.randn(2, 8, 32, requires_grad=True)
+        # 4 visible, 4 predicted
+        vmask = torch.tensor([[0, 0, 0, 0, 2, 2, 2, 2]] * 2)
+        decoded = decoder(all_tokens, vmask)
         decoded.sum().backward()
-        assert context.grad is not None
+        assert all_tokens.grad is not None

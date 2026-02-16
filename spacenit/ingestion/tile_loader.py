@@ -696,12 +696,24 @@ class GeoTileLoaderConfig(Config):
         assert build_masking_policy is not None, (
             "spacenit.pipeline.masking is required but could not be imported"
         )
-        masking_strategy = build_masking_policy(dict(self.masking_config))
-        masking_strategy_b = (
-            build_masking_policy(dict(self.masking_config_b))
-            if self.masking_config_b is not None
-            else None
+        masking_strategy = build_masking_policy(
+            dict(self.masking_config),
+            tokenization_config=self.tokenization_config,
         )
+        if self.masking_config_b is not None:
+            masking_strategy_b = build_masking_policy(
+                dict(self.masking_config_b),
+                tokenization_config=self.tokenization_config,
+            )
+        elif self.num_masked_views == 2:
+            # Use an independent masking policy instance for the second view so
+            # per-batch counters (scheduled masking) don't advance twice.
+            masking_strategy_b = build_masking_policy(
+                dict(self.masking_config),
+                tokenization_config=self.tokenization_config,
+            )
+        else:
+            masking_strategy_b = None
 
         # Select appropriate collator based on num_masked_views.
         # Use batched collators that apply transform + masking to the entire

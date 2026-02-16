@@ -94,29 +94,54 @@ class RandomDihedralTransform:
                 continue
 
             if spec.varies_in_space_and_time or spec.varies_in_space_only:
-                data = _apply_dihedral_to_spatial(data, sym)
+                data = _apply_dihedral_to_spatial(
+                    data,
+                    sym,
+                    total_channels=getattr(spec, "total_channels", None),
+                )
 
             new_fields[key] = data
 
         return GeoSample(**new_fields)
 
 
-def _apply_dihedral_to_spatial(x: Tensor, sym: int) -> Tensor:
+def _apply_dihedral_to_spatial(
+    x: Tensor,
+    sym: int,
+    *,
+    total_channels: int | None = None,
+) -> Tensor:
     """Apply dihedral symmetry to a tensor with spatial dimensions.
 
-    Expects the first two (non-batch) dimensions to be spatial (H, W).
-    Works with shapes like:
-    - ``(H, W, T, C)`` -- unbatched spatiotemporal
-    - ``(B, H, W, T, C)`` -- batched spatiotemporal
-    - ``(H, W, C)`` -- unbatched spatial-only
-    - ``(B, H, W, C)`` -- batched spatial-only
-
-    The spatial dimensions are always the first two after any batch dim.
+    Supports channel-last and channel-first layouts.
     """
-    # This function is called on per-sample (unbatched) GeoSample fields.
-    # Spatial dims are always the first two: (H, W, ...).
-    # Shapes: (H, W, C) for spatial-only, (H, W, T, C) for spatiotemporal.
-    h_dim, w_dim = 0, 1
+    # Infer which dimensions correspond to (H, W).
+    if x.ndim == 5:
+        # (B,C,H,W,T) or (B,H,W,T,C)
+        if total_channels is not None and x.shape[1] == total_channels:
+            h_dim, w_dim = 2, 3
+        else:
+            h_dim, w_dim = 1, 2
+    elif x.ndim == 4:
+        # (B,C,H,W) or (B,H,W,C) or (C,H,W,T) or (H,W,T,C)
+        if total_channels is not None and x.shape[1] == total_channels:
+            h_dim, w_dim = 2, 3  # (B,C,H,W)
+        elif total_channels is not None and x.shape[0] == total_channels:
+            h_dim, w_dim = 1, 2  # (C,H,W,...) channel-first unbatched
+        elif total_channels is not None and x.shape[-1] == total_channels:
+            # channel-last; batched uses (B,H,W,C) where spatial dims are 1,2
+            h_dim, w_dim = 1, 2
+        else:
+            # Fallback: assume channel-first batched for 4D tensors.
+            h_dim, w_dim = 2, 3
+    elif x.ndim == 3:
+        # (C,H,W) or (H,W,C)
+        if total_channels is not None and x.shape[0] == total_channels:
+            h_dim, w_dim = 1, 2
+        else:
+            h_dim, w_dim = 0, 1
+    else:
+        return x
 
     if sym == 0:
         return x  # identity

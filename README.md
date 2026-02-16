@@ -303,39 +303,62 @@ Quick check:
 uv run python -c "import spacenit; print('spacenit loaded')"
 ```
 
-### Training (Nano, 8x H100, FSDP)
+### Training (Nano LatentMIM, 8x H100, DDP) — what we run in production
 
 ```bash
-cd spacenit
+cd /workspace/Spatial/spacenit
 
 # HDF5 compression plugins
 export HDF5_PLUGIN_PATH="$(
-  ./.venv/bin/python -c "import hdf5plugin; print(hdf5plugin.PLUGINS_PATH)"
+  /workspace/Spatial/spacenit/.venv/bin/python -c "import hdf5plugin; print(hdf5plugin.PLUGINS_PATH)"
 )"
 
-# W&B (set your key, or use WANDB_MODE=offline)
-export WANDB_API_KEY="YOUR_KEY"
+# W&B API key (pulled from /root/.netrc; alternative is `wandb login`)
+export WANDB_API_KEY="$(
+  /workspace/Spatial/spacenit/.venv/bin/python - <<'PY'
+import netrc
+n = netrc.netrc('/root/.netrc')
+a = n.authenticators('api.wandb.ai')
+if not a or not a[2]:
+    raise SystemExit('No wandb key in /root/.netrc')
+print(a[2])
+PY
+)"
 
 # Optional: GeoBench for downstream eval
 export GEOBENCH_DIR="/workspace/datasets/geobench"
 
-./.venv/bin/torchrun --standalone --nproc_per_node=8 scripts/official/nano.py \
-  train nano_100ep_fsdp local \
-  --dataset.h5py_dir=/path/to/your/h5py_dataset \
-  --train_module.dp_config.name=fsdp \
+# Fresh start (optional)
+rm -rf local_output/checkpoints/anonymous/nano_latentmim_30ep_eval2000
+
+/workspace/Spatial/spacenit/.venv/bin/torchrun --standalone --nproc_per_node=8 scripts/official/nano.py \
+  train nano_latentmim_30ep_eval2000 local \
+  --dataset.h5py_dir=/workspace/Spatial/spacenit/local_olmoearth_indexed/h5py_data/cdl_gse_landsat_openstreetmap_raster_sentinel1_sentinel2_l2a_srtm_worldcereal_worldcover_worldpop_wri_canopy_height_map/220094 \
+  --train_module.dp_config.name=ddp \
   --data_loader.global_batch_size=512 \
   --train_module.rank_microbatch_size=32 \
   --data_loader.num_workers=4 \
   --trainer.callbacks.wandb.enabled=True \
+  --trainer.callbacks.wandb.entity=viharikvs-urbankisaan \
+  --trainer.callbacks.wandb.project=spacenit \
+  --trainer.callbacks.wandb.upload_dataset_distribution_pre_train=False \
+  --trainer.callbacks.wandb.upload_modality_data_band_distribution_pre_train=False \
   --trainer.callbacks.downstream_evaluator.enabled=True \
   --trainer.callbacks.downstream_evaluator.tasks_to_run='["m-eurosat"]' \
-  --trainer.callbacks.checkpointer.save_interval=5000 \
-  --trainer.callbacks.checkpointer.ephemeral_save_interval=500 \
+  --trainer.callbacks.downstream_evaluator.eval_on_startup=False \
+  --trainer.callbacks.downstream_evaluator.run_on_test=False \
+  --trainer.callbacks.checkpointer.save_async=False \
+  --trainer.callbacks.checkpointer.pre_train_checkpoint=False \
+  --trainer.callbacks.checkpointer.save_interval=4290 \
+  --trainer.callbacks.checkpointer.ephemeral_save_interval=429 \
   --trainer.max_duration.unit=epochs \
-  --trainer.max_duration.value=100
+  --trainer.max_duration.value=30
 ```
 
-Training automatically resumes from the latest checkpoint in the output directory.
+Notes:
+
+- **Resume**: omit the `rm -rf ...` line and re-run the same command; it will resume from the latest checkpoint in that run folder.
+- **Eval cadence**: `m-eurosat` eval is configured to run every **2000 steps** in `scripts/official/script.py` (see `EVAL_TASKS["m-eurosat"].eval_interval`).
 
 ### Running Tests
 

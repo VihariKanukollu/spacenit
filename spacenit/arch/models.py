@@ -30,6 +30,7 @@ from spacenit.arch.encoder import Decoder, Encoder, EncoderConfig
 from spacenit.arch.helpers import ParallelMixin
 from spacenit.arch.heads import PixelHead, PoolingHead, ProjectionHead
 from spacenit.settings import Config
+from spacenit.structures import TokenVisibility
 
 
 # ---------------------------------------------------------------------------
@@ -131,12 +132,14 @@ class LatentPredictor(ParallelMixin, nn.Module):
         for p in self.target_encoder.parameters():
             p.requires_grad = False
 
-        # Decoder
+        # Decoder (with positional re-encoding for mask tokens)
+        num_sensors = len(config.encoder.sensor_labels) or 32
         self.decoder = Decoder(
             embed_dim=config.encoder.embed_dim,
             depth=config.decoder_depth,
             num_heads=config.decoder_num_heads,
             num_kv_heads=config.decoder_num_kv_heads,
+            num_sensors=num_sensors,
         )
 
         # Projection heads (online and target)
@@ -156,6 +159,34 @@ class LatentPredictor(ParallelMixin, nn.Module):
         self.register_buffer(
             "_step", torch.tensor(0, dtype=torch.long), persistent=True
         )
+
+    @staticmethod
+    def _mean_pool_patch_tokens(
+        tokens: Tensor,
+        *,
+        spatial_ids: Tensor | None = None,
+        visibility_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Mean-pool patch tokens (exclude sensor-type and ABSENT).
+
+        OLMo-Earth pools over patch tokens; SpaceNit additionally includes
+        per-sensor type tokens (spatial_ids == -1). We exclude them here so
+        pooled representations are comparable.
+        """
+        B, N, _D = tokens.shape
+        keep = torch.ones((B, N), dtype=torch.bool, device=tokens.device)
+
+        if spatial_ids is not None:
+            # Sensor-type tokens have spatial_ids == (-1, -1).
+            keep = keep & (spatial_ids[..., 0] != -1)
+
+        if visibility_mask is not None:
+            ABS = TokenVisibility.ABSENT.value
+            keep = keep & (visibility_mask != ABS)
+
+        denom = keep.sum(dim=1).clamp(min=1).unsqueeze(-1)  # (B, 1)
+        pooled = (tokens * keep.unsqueeze(-1)).sum(dim=1) / denom  # (B, D)
+        return pooled
 
     @torch.no_grad()
     def step_ema(self) -> None:
@@ -234,8 +265,7 @@ class LatentPredictor(ParallelMixin, nn.Module):
         self,
         sensor_data: dict[str, Tensor],
         *,
-        visible_indices: Tensor | None = None,
-        target_indices: Tensor | None = None,
+        visibility_mask: Tensor | None = None,
         patch_size: int | None = None,
         month_indices: Tensor | None = None,
         gsd: float = 10.0,
@@ -245,55 +275,157 @@ class LatentPredictor(ParallelMixin, nn.Module):
 
         Args:
             sensor_data: Mapping from sensor label to data tensor.
-            visible_indices: ``(B, N_vis)`` indices of visible tokens for
-                the online encoder.
-            target_indices: ``(B, N_tgt)`` indices of tokens to predict.
+            visibility_mask: ``(B, N)`` integer mask with
+                :class:`TokenVisibility` values for the full token
+                sequence.  ``VISIBLE_ENCODER`` (0) = context for
+                encoder pooling and decoder context.  ``PREDICTED`` (2)
+                = decoder targets.  If ``None``, all tokens are treated
+                as visible (no masking / contrastive-only mode).
             patch_size: Runtime patch size.
             month_indices: Month-of-year indices.
             gsd: Ground-sample distance.
             contrastive_only: If ``True``, skip the decoder and produce
                 mean-pooled encoder representations for contrastive
-                learning.  Returns ``"online_proj"`` and
-                ``"target_proj"`` only (both ``(B, projection_dim)``).
+                learning.
 
         Returns:
             Dictionary with keys (full mode):
-            - ``"predictions"`` -- decoder output ``(B, N_tgt, D)``.
-            - ``"targets"`` -- target encoder output ``(B, N_tgt, D)``.
-            - ``"online_proj"`` -- projected online representations.
-            - ``"target_proj"`` -- projected target representations.
+            - ``"predictions"`` -- decoder output at PREDICTED positions
+              ``(B, N_tgt, D)``.
+            - ``"targets"`` -- target encoder output at PREDICTED
+              positions ``(B, N_tgt, D)``.
+            - ``"online_proj"`` -- projected predictions
+              ``(B, N_tgt, D_proj)``.
+            - ``"target_proj"`` -- projected targets
+              ``(B, N_tgt, D_proj)``.
+            - ``"encoder_pooled"`` -- mean-pooled online encoder output
+              over VISIBLE tokens ``(B, D)``.
 
             Or (contrastive_only mode):
             - ``"online_proj"`` -- ``(B, projection_dim)`` L2-normalised.
             - ``"target_proj"`` -- ``(B, projection_dim)`` L2-normalised.
         """
-        # Online encoder (visible tokens only)
-        encoded, sensor_ids, layout = self.encoder(
-            sensor_data,
-            patch_size=patch_size,
-            month_indices=month_indices,
-            gsd=gsd,
-            mask_indices=visible_indices,
-        )
+        VIS = TokenVisibility.VISIBLE_ENCODER.value
+        PRED = TokenVisibility.PREDICTED.value
+        ABS = TokenVisibility.ABSENT.value
 
-        # Target encoder (all tokens, no gradient)
-        with torch.no_grad():
-            target_encoded, _, _ = self.target_encoder(
+        # ==============================================================
+        # Step 1: Tokenize (full sequence -- we need metadata for all
+        # positions even though the encoder will only see visible ones).
+        # ==============================================================
+        full_tokens, sensor_ids, spatial_ids, temporal_ids, layout = (
+            self.encoder.tokenizer(sensor_data, patch_size)
+        )
+        B, N, D = full_tokens.shape
+
+        # ==============================================================
+        # Step 2: Online encoder -- process ONLY visible tokens.
+        #
+        # Matching OLMo-Earth: the encoder physically removes masked
+        # tokens so that it never attends to them.  This creates the
+        # information bottleneck that forces the encoder to learn
+        # generalizable representations.
+        # ==============================================================
+        if visibility_mask is not None and not contrastive_only:
+            vis_bool = (visibility_mask == VIS)  # (B, N)
+            # Build mask_indices: (B, N_vis) -- indices of visible tokens.
+            # All samples must have the same count for gather to work with
+            # a fixed-size tensor.  With uniform masking ratios on
+            # same-shape data this is guaranteed; clamp as safety.
+            n_vis = int(vis_bool.sum(dim=1).max().item())
+            # Pad to n_vis per sample (take first n_vis True indices).
+            mask_indices = torch.zeros(B, n_vis, dtype=torch.long, device=full_tokens.device)
+            for b in range(B):
+                idxs = torch.nonzero(vis_bool[b], as_tuple=False).squeeze(-1)
+                actual = idxs.shape[0]
+                if actual >= n_vis:
+                    mask_indices[b] = idxs[:n_vis]
+                else:
+                    # Fewer visible tokens than max -- pad with last valid
+                    mask_indices[b, :actual] = idxs
+                    if actual > 0:
+                        mask_indices[b, actual:] = idxs[-1]
+        else:
+            mask_indices = None
+
+        encoded, enc_sensor_ids, enc_spatial_ids, enc_temporal_ids, _ = (
+            self.encoder(
                 sensor_data,
                 patch_size=patch_size,
                 month_indices=month_indices,
                 gsd=gsd,
+                mask_indices=mask_indices,
             )
+        )
+
+        # ==============================================================
+        # Step 3: Target encoder -- sees ALL *present* tokens (no masking
+        # w.r.t. VISIBLE vs PREDICTED), but must still exclude ABSENT
+        # tokens. This matches OLMo-Earth: `batch.unmask()` keeps missing
+        # tokens missing, and the encoder removes non-ONLINE tokens.
+        #
+        # We therefore encode tokens where visibility_mask != ABSENT, then
+        # scatter back to the full sequence for alignment with pred_indices.
+        # ==============================================================
+        target_mask_indices = None
+        if visibility_mask is not None:
+            non_abs_bool = (visibility_mask != ABS)  # (B, N)
+            n_keep = int(non_abs_bool.sum(dim=1).max().item())
+            target_mask_indices = torch.zeros(
+                B, n_keep, dtype=torch.long, device=full_tokens.device
+            )
+            for b in range(B):
+                idxs = torch.nonzero(non_abs_bool[b], as_tuple=False).squeeze(-1)
+                actual = idxs.shape[0]
+                if actual >= n_keep:
+                    target_mask_indices[b] = idxs[:n_keep]
+                else:
+                    target_mask_indices[b, :actual] = idxs
+                    if actual > 0:
+                        target_mask_indices[b, actual:] = idxs[-1]
+
+        with torch.no_grad():
+            target_sub, _, _, _, _ = self.target_encoder(
+                sensor_data,
+                patch_size=patch_size,
+                month_indices=month_indices,
+                gsd=gsd,
+                mask_indices=target_mask_indices,
+            )
+
+        # Scatter back to full length for downstream gathers.
+        target_encoded = full_tokens.new_zeros(B, N, target_sub.shape[-1])
+        if target_mask_indices is not None:
+            idx_expand = target_mask_indices.unsqueeze(-1).expand(
+                -1, -1, target_sub.shape[-1]
+            )
+            target_encoded.scatter_(1, idx_expand, target_sub)
+        else:
+            target_encoded = target_sub
+
+        # ==============================================================
+        # Step 4: Encoder pooling (over visible tokens only).
+        # When mask_indices is used, *all* encoder outputs are visible,
+        # so no masking is needed for the pool.
+        # ==============================================================
+        encoder_pooled = self._mean_pool_patch_tokens(
+            encoded,
+            spatial_ids=enc_spatial_ids,
+            visibility_mask=None,
+        )  # (B, D)
 
         # ----------------------------------------------------------
         # Contrastive-only mode: pool + project, skip decoder
         # ----------------------------------------------------------
         if contrastive_only:
-            online_pooled = encoded.mean(dim=1)       # (B, D)
-            online_z = self.online_proj(online_pooled)
+            online_z = self.online_proj(encoder_pooled)
 
             with torch.no_grad():
-                target_pooled = target_encoded.mean(dim=1)
+                target_pooled = self._mean_pool_patch_tokens(
+                    target_encoded,
+                    spatial_ids=spatial_ids,
+                    visibility_mask=visibility_mask,
+                )
                 target_z = self.target_proj(target_pooled)
 
             return {
@@ -304,22 +436,58 @@ class LatentPredictor(ParallelMixin, nn.Module):
         # ----------------------------------------------------------
         # Full mode: decode + project
         # ----------------------------------------------------------
+        if visibility_mask is None:
+            # No masking: nothing to decode.
+            return {
+                "predictions": encoded,
+                "targets": target_encoded.detach(),
+                "online_proj": self.online_proj(encoded),
+                "target_proj": self.target_proj(target_encoded).detach(),
+                "encoder_pooled": encoder_pooled,
+            }
 
-        # Extract target representations at prediction positions
-        num_predictions = target_indices.shape[1] if target_indices is not None else 0
-        if target_indices is not None and num_predictions > 0:
-            B, _, D = target_encoded.shape
-            idx = target_indices.unsqueeze(-1).expand(-1, -1, D)
-            targets = torch.gather(target_encoded, dim=1, index=idx)
+        # ==============================================================
+        # Step 5: Reconstruct full-length sequence for the decoder.
+        #
+        # Place encoder outputs at visible positions; masked positions
+        # get zeros (the decoder replaces them with mask_token anyway).
+        # ==============================================================
+        full_encoded = full_tokens.new_zeros(B, N, encoded.shape[-1])
+        if mask_indices is not None:
+            idx_expand = mask_indices.unsqueeze(-1).expand(-1, -1, encoded.shape[-1])
+            full_encoded.scatter_(1, idx_expand, encoded)
         else:
-            targets = target_encoded
+            full_encoded = encoded
 
-        # Decode
-        predictions = self.decoder(
-            encoded, num_predictions=num_predictions
+        # ==============================================================
+        # Step 6: Decoder -- full sequence + visibility mask.
+        # ==============================================================
+        used_patch_size = patch_size or self.encoder.config.base_patch_size
+        decoded = self.decoder(
+            full_encoded,
+            visibility_mask,
+            sensor_ids=sensor_ids,
+            spatial_ids=spatial_ids,
+            temporal_ids=temporal_ids,
+            month_indices=month_indices,
+            patch_size=used_patch_size,
+            gsd=gsd,
         )
 
-        # Project
+        # --- Extract PREDICTED positions ---
+        pred_mask = (visibility_mask == PRED)  # (B, N)
+        n_pred = int(pred_mask.sum(dim=1).max().item())
+
+        if n_pred > 0:
+            pred_indices = torch.nonzero(pred_mask, as_tuple=False)[:, 1].view(B, -1)
+            idx = pred_indices.unsqueeze(-1).expand(-1, -1, D)
+            predictions = torch.gather(decoded, dim=1, index=idx)
+            targets = torch.gather(target_encoded, dim=1, index=idx)
+        else:
+            predictions = decoded.new_zeros(B, 0, D)
+            targets = target_encoded.new_zeros(B, 0, D)
+
+        # --- Project ---
         online_proj = self.online_proj(predictions)
         with torch.no_grad():
             target_proj = self.target_proj(targets)
@@ -329,6 +497,7 @@ class LatentPredictor(ParallelMixin, nn.Module):
             "targets": targets.detach(),
             "online_proj": online_proj,
             "target_proj": target_proj.detach(),
+            "encoder_pooled": encoder_pooled,
         }
 
 
@@ -364,11 +533,13 @@ class AutoEncoder(nn.Module):
         self.config = config
 
         self.encoder = Encoder(config.encoder)
+        num_sensors = len(config.encoder.sensor_labels) or 32
         self.decoder = Decoder(
             embed_dim=config.encoder.embed_dim,
             depth=config.decoder_depth,
             num_heads=config.decoder_num_heads,
             num_kv_heads=config.decoder_num_kv_heads,
+            num_sensors=num_sensors,
         )
         self.pixel_head = PixelHead(
             embed_dim=config.encoder.embed_dim,
@@ -380,8 +551,7 @@ class AutoEncoder(nn.Module):
         self,
         sensor_data: dict[str, Tensor],
         *,
-        visible_indices: Tensor | None = None,
-        masked_indices: Tensor | None = None,
+        visibility_mask: Tensor | None = None,
         patch_size: int | None = None,
         month_indices: Tensor | None = None,
         gsd: float = 10.0,
@@ -390,20 +560,61 @@ class AutoEncoder(nn.Module):
     ) -> dict[str, Tensor]:
         """Forward pass.
 
+        Args:
+            sensor_data: Mapping from sensor label to data tensor.
+            visibility_mask: ``(B, N)`` integer mask with
+                :class:`TokenVisibility` values.  If ``None``, all
+                tokens are treated as visible (no masking).
+            patch_size: Runtime patch size.
+            month_indices: Month-of-year indices.
+            gsd: Ground-sample distance.
+            height: Spatial height for pixel reconstruction.
+            width: Spatial width for pixel reconstruction.
+
         Returns:
             Dictionary with ``"reconstructed"`` pixel output and
             ``"encoded"`` latent representations.
         """
-        encoded, sensor_ids, layout = self.encoder(
+        encoded, sensor_ids, spatial_ids, temporal_ids, layout = self.encoder(
             sensor_data,
             patch_size=patch_size,
             month_indices=month_indices,
             gsd=gsd,
-            mask_indices=visible_indices,
         )
+        used_patch_size = patch_size or self.encoder.config.base_patch_size
 
-        num_masked = masked_indices.shape[1] if masked_indices is not None else 0
-        decoded = self.decoder(encoded, num_predictions=num_masked)
+        if visibility_mask is not None:
+            decoded = self.decoder(
+                encoded, visibility_mask,
+                sensor_ids=sensor_ids,
+                spatial_ids=spatial_ids,
+                temporal_ids=temporal_ids,
+                month_indices=month_indices,
+                patch_size=used_patch_size,
+                gsd=gsd,
+            )
+            # Extract PREDICTED positions for pixel reconstruction.
+            PRED = 2  # TokenVisibility.PREDICTED
+            pred_mask = (visibility_mask == PRED)
+            B, N, D = decoded.shape
+            n_pred = int(pred_mask.sum(dim=1).max().item())
+            if n_pred > 0:
+                pred_indices = torch.nonzero(pred_mask, as_tuple=False)[:, 1].view(B, -1)
+                idx = pred_indices.unsqueeze(-1).expand(-1, -1, D)
+                decoded = torch.gather(decoded, dim=1, index=idx)
+        else:
+            # No masking: pass a trivial all-visible mask.
+            B, N, D = encoded.shape
+            vis_mask = torch.zeros(B, N, dtype=torch.long, device=encoded.device)
+            decoded = self.decoder(
+                encoded, vis_mask,
+                sensor_ids=sensor_ids,
+                spatial_ids=spatial_ids,
+                temporal_ids=temporal_ids,
+                month_indices=month_indices,
+                patch_size=used_patch_size,
+                gsd=gsd,
+            )
 
         reconstructed = self.pixel_head(decoded, height, width)
 
@@ -461,11 +672,13 @@ class DualBranch(ParallelMixin, nn.Module):
             p.requires_grad = False
 
         # Latent prediction decoder
+        num_sensors = len(config.encoder.sensor_labels) or 32
         self.latent_decoder = Decoder(
             embed_dim=dim,
             depth=config.decoder_depth,
             num_heads=config.decoder_num_heads,
             num_kv_heads=config.decoder_num_kv_heads,
+            num_sensors=num_sensors,
         )
 
         # Pixel reconstruction decoder
@@ -474,6 +687,7 @@ class DualBranch(ParallelMixin, nn.Module):
             depth=config.decoder_depth,
             num_heads=config.decoder_num_heads,
             num_kv_heads=config.decoder_num_kv_heads,
+            num_sensors=num_sensors,
         )
         self.pixel_head = PixelHead(
             embed_dim=dim,
@@ -537,51 +751,86 @@ class DualBranch(ParallelMixin, nn.Module):
         self,
         sensor_data: dict[str, Tensor],
         *,
-        visible_indices: Tensor | None = None,
-        target_indices: Tensor | None = None,
+        visibility_mask: Tensor | None = None,
         patch_size: int | None = None,
         month_indices: Tensor | None = None,
         gsd: float = 10.0,
         height: int = 224,
         width: int = 224,
     ) -> dict[str, Tensor]:
-        """Forward pass producing both latent predictions and pixel reconstructions."""
-        # Online encoder
-        encoded, sensor_ids, layout = self.encoder(
+        """Forward pass producing both latent predictions and pixel reconstructions.
+
+        Args:
+            sensor_data: Mapping from sensor label to data tensor.
+            visibility_mask: ``(B, N)`` integer mask with
+                :class:`TokenVisibility` values.
+        """
+        PRED = 2  # TokenVisibility.PREDICTED
+
+        # Online encoder (all tokens)
+        encoded, sensor_ids, spatial_ids, temporal_ids, layout = self.encoder(
             sensor_data,
             patch_size=patch_size,
             month_indices=month_indices,
             gsd=gsd,
-            mask_indices=visible_indices,
         )
+        used_patch_size = patch_size or self.encoder.config.base_patch_size
 
         # Target encoder
         with torch.no_grad():
-            target_encoded, _, _ = self.target_encoder(
+            target_encoded, _, _, _, _ = self.target_encoder(
                 sensor_data,
                 patch_size=patch_size,
                 month_indices=month_indices,
                 gsd=gsd,
             )
 
-        num_targets = target_indices.shape[1] if target_indices is not None else 0
+        B, N, D = encoded.shape
 
-        # Extract targets
-        if target_indices is not None and num_targets > 0:
-            B, _, D = target_encoded.shape
-            idx = target_indices.unsqueeze(-1).expand(-1, -1, D)
+        if visibility_mask is None:
+            visibility_mask = torch.zeros(B, N, dtype=torch.long, device=encoded.device)
+
+        # Latent prediction branch (decoder handles mask replacement)
+        latent_decoded = self.latent_decoder(
+            encoded, visibility_mask,
+            sensor_ids=sensor_ids,
+            spatial_ids=spatial_ids,
+            temporal_ids=temporal_ids,
+            month_indices=month_indices,
+            patch_size=used_patch_size,
+            gsd=gsd,
+        )
+
+        # Pixel reconstruction branch
+        pixel_decoded = self.pixel_decoder(
+            encoded, visibility_mask,
+            sensor_ids=sensor_ids,
+            spatial_ids=spatial_ids,
+            temporal_ids=temporal_ids,
+            month_indices=month_indices,
+            patch_size=used_patch_size,
+            gsd=gsd,
+        )
+
+        # Extract PREDICTED positions
+        pred_mask = (visibility_mask == PRED)
+        n_pred = int(pred_mask.sum(dim=1).max().item())
+
+        if n_pred > 0:
+            pred_indices = torch.nonzero(pred_mask, as_tuple=False)[:, 1].view(B, -1)
+            idx = pred_indices.unsqueeze(-1).expand(-1, -1, D)
+            latent_pred = torch.gather(latent_decoded, dim=1, index=idx)
             targets = torch.gather(target_encoded, dim=1, index=idx)
+            pixel_pred = torch.gather(pixel_decoded, dim=1, index=idx)
         else:
+            latent_pred = latent_decoded
             targets = target_encoded
+            pixel_pred = pixel_decoded
 
-        # Latent prediction branch
-        latent_pred = self.latent_decoder(encoded, num_predictions=num_targets)
         online_proj = self.online_proj(latent_pred)
         with torch.no_grad():
             target_proj = self.target_proj(targets)
 
-        # Pixel reconstruction branch
-        pixel_pred = self.pixel_decoder(encoded, num_predictions=num_targets)
         reconstructed = self.pixel_head(pixel_pred, height, width)
 
         return {
@@ -789,7 +1038,7 @@ class SpatioTemporalEncoder(ParallelMixin, nn.Module):
             representations.
         """
         # Initial encoding (standard transformer)
-        encoded, sensor_ids, layout = self.encoder(
+        encoded, sensor_ids, _spatial_ids, _temporal_ids, layout = self.encoder(
             sensor_data,
             patch_size=patch_size,
             month_indices=month_indices,

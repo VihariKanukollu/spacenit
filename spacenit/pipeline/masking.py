@@ -58,8 +58,10 @@ def create_mask(
     Args:
         num_tokens: Total number of tokens to mask.
         encode_ratio: Fraction of tokens visible to the encoder.
-        decode_ratio: Fraction of tokens visible only to the target
-            (momentum) encoder.  The remainder are ``PREDICTED``.
+        decode_ratio: Fraction of tokens that are prediction targets for the
+            decoder (``PREDICTED``). The remainder (not visible and not
+            predicted) are ``TARGET_ONLY`` (visible only to the target /
+            momentum encoder).
         structure: Masking pattern.  One of:
 
             - ``"random"`` -- uniformly random per-token masking.
@@ -78,7 +80,10 @@ def create_mask(
     Returns:
         Integer tensor ``(num_tokens,)`` of :class:`TokenVisibility` values.
     """
-    mask = torch.full((num_tokens,), TokenVisibility.PREDICTED.value, dtype=torch.long)
+    # Default: tokens are only visible to the target (momentum) encoder.
+    # We then mark a subset as VISIBLE_ENCODER (context) and a subset as
+    # PREDICTED (decoder targets).
+    mask = torch.full((num_tokens,), TokenVisibility.TARGET_ONLY.value, dtype=torch.long)
 
     if structure == "random":
         mask = _random_mask(mask, encode_ratio, decode_ratio, generator)
@@ -105,12 +110,19 @@ def _random_mask(
     """Uniformly random per-token masking."""
     N = mask.shape[0]
     perm = torch.randperm(N, generator=generator)
-    n_encode = max(1, int(N * encode_ratio))
+    n_encode = int(N * encode_ratio)
+    # Ensure at least one visible token when encode_ratio > 0.
+    # This avoids degenerate "empty context" batches and matches the unit tests.
+    if encode_ratio > 0 and N > 0:
+        n_encode = max(1, n_encode)
     n_decode = int(N * decode_ratio)
+    if n_encode + n_decode > N:
+        n_decode = max(0, N - n_encode)
 
-    mask[perm[:n_encode]] = TokenVisibility.VISIBLE_ENCODER.value
+    if n_encode > 0:
+        mask[perm[:n_encode]] = TokenVisibility.VISIBLE_ENCODER.value
     if n_decode > 0:
-        mask[perm[n_encode : n_encode + n_decode]] = TokenVisibility.TARGET_ONLY.value
+        mask[perm[n_encode : n_encode + n_decode]] = TokenVisibility.PREDICTED.value
     return mask
 
 
@@ -133,8 +145,10 @@ def _spatial_mask(
 
     # Create a 2D mask at the patch level
     total_patches = H * W
-    n_visible_patches = max(1, int(total_patches * encode_ratio))
+    n_visible_patches = int(total_patches * encode_ratio)
     n_decode_patches = int(total_patches * decode_ratio)
+    if n_visible_patches + n_decode_patches > total_patches:
+        n_decode_patches = max(0, total_patches - n_visible_patches)
 
     perm = torch.randperm(total_patches, generator=generator)
     visible_patches = perm[:n_visible_patches]
@@ -149,7 +163,7 @@ def _spatial_mask(
     for p in decode_patches:
         start = p * tokens_per_position
         end = min(start + tokens_per_position, N)
-        mask[start:end] = TokenVisibility.TARGET_ONLY.value
+        mask[start:end] = TokenVisibility.PREDICTED.value
 
     return mask
 
@@ -165,8 +179,10 @@ def _temporal_mask(
     N = mask.shape[0]
     tokens_per_step = N // temporal_length if temporal_length > 0 else N
 
-    n_visible_steps = max(1, int(temporal_length * encode_ratio))
+    n_visible_steps = int(temporal_length * encode_ratio)
     n_decode_steps = int(temporal_length * decode_ratio)
+    if n_visible_steps + n_decode_steps > temporal_length:
+        n_decode_steps = max(0, temporal_length - n_visible_steps)
 
     perm = torch.randperm(temporal_length, generator=generator)
     visible_steps = perm[:n_visible_steps]
@@ -180,7 +196,7 @@ def _temporal_mask(
     for t in decode_steps:
         start = t * tokens_per_step
         end = min(start + tokens_per_step, N)
-        mask[start:end] = TokenVisibility.TARGET_ONLY.value
+        mask[start:end] = TokenVisibility.PREDICTED.value
 
     return mask
 
@@ -196,8 +212,10 @@ def _spectral_mask(
     N = mask.shape[0]
     tokens_per_group = N // num_groups if num_groups > 0 else N
 
-    n_visible = max(1, int(num_groups * encode_ratio))
+    n_visible = int(num_groups * encode_ratio)
     n_decode = int(num_groups * decode_ratio)
+    if n_visible + n_decode > num_groups:
+        n_decode = max(0, num_groups - n_visible)
 
     perm = torch.randperm(num_groups, generator=generator)
     visible_groups = perm[:n_visible]
@@ -211,7 +229,7 @@ def _spectral_mask(
     for g in decode_groups:
         start = g * tokens_per_group
         end = min(start + tokens_per_group, N)
-        mask[start:end] = TokenVisibility.TARGET_ONLY.value
+        mask[start:end] = TokenVisibility.PREDICTED.value
 
     return mask
 
@@ -537,6 +555,8 @@ def _mark_absent_tokens(
     patch_size: int,
     absent_indicator: int,
     absent_value: int,
+    *,
+    num_groups: int | None = None,
 ) -> None:
     """In-place: set mask entries to *absent_value* where data is missing.
 
@@ -558,6 +578,9 @@ def _mark_absent_tokens(
     total_channels = getattr(spec, "total_channels", None)
 
     sensor_label = getattr(spec, "label", "unknown")
+
+    if num_groups is None:
+        num_groups = int(getattr(spec, "group_count", 1))
 
     if spec.varies_in_space_and_time:
         # Canonical: (C, H, W, T)
@@ -590,7 +613,7 @@ def _mark_absent_tokens(
         # All channels absent in a patch-timestep? -> (Hp, Wp, T) bool
         absent_map = (d == absent_indicator).all(dim=(0, 2, 4))
         # Repeat for each spectral group -> (num_groups * Hp * Wp * T,)
-        absent_flat = absent_map.reshape(-1).repeat(spec.group_count)
+        absent_flat = absent_map.reshape(-1).repeat(num_groups)
         if absent_flat.shape[0] == mask.shape[0]:
             mask[absent_flat] = absent_value
         else:
@@ -641,7 +664,7 @@ def _mark_absent_tokens(
             return
         d = d.reshape(C, Hp, P, Wp, P)
         absent_map = (d == absent_indicator).all(dim=(0, 2, 4))  # (Hp, Wp)
-        absent_flat = absent_map.reshape(-1).repeat(spec.group_count)
+        absent_flat = absent_map.reshape(-1).repeat(num_groups)
         if absent_flat.shape[0] == mask.shape[0]:
             mask[absent_flat] = absent_value
         else:
@@ -660,7 +683,7 @@ def _mark_absent_tokens(
                 absent_per_t = (d == absent_indicator).all(dim=0)  # (T,)
             else:
                 absent_per_t = (d == absent_indicator).all(dim=1)  # (T,)
-            absent_flat = absent_per_t.repeat(spec.group_count)
+            absent_flat = absent_per_t.repeat(num_groups)
             if absent_flat.shape[0] == mask.shape[0]:
                 mask[absent_flat] = absent_value
             else:
@@ -671,7 +694,7 @@ def _mark_absent_tokens(
                 )
 
     # Scalar sensors: if all values are absent, mark the single token
-    elif spec.group_count == 1 and mask.shape[0] == 1:
+    elif num_groups == 1 and mask.shape[0] == 1:
         if (d == absent_indicator).all():
             mask[0] = absent_value
 
@@ -680,6 +703,7 @@ def mask_sample(
     sample: GeoSample,
     strategy: MaskingStrategy,
     patch_size: int,
+    tokenization_config: Any | None = None,
     *,
     step: int = 0,
     generator: torch.Generator | None = None,
@@ -693,6 +717,8 @@ def mask_sample(
         sample: Input geospatial sample.
         strategy: Masking strategy to apply.
         patch_size: Patch size for spatial alignment.
+        tokenization_config: Optional tokenization config that controls how
+            channels are grouped into tokens (affects per-sensor group count).
         step: Current training step (for scheduled strategies).
         generator: Optional RNG.
 
@@ -722,6 +748,14 @@ def mask_sample(
         spec = SensorRegistry.get(sensor_label)
         fields[sensor_label] = data
 
+        # Token groups (a.k.a. band-sets) must match the encoder tokenization.
+        num_groups = spec.group_count
+        if tokenization_config is not None:
+            try:
+                num_groups = int(tokenization_config.group_count_for(sensor_label))
+            except Exception:
+                num_groups = spec.group_count
+
         # Determine token count and spatial/temporal structure
         total_channels = getattr(spec, "total_channels", None)
 
@@ -744,7 +778,7 @@ def mask_sample(
                 )
             H_p = H // (patch_size * spec.tile_size_multiplier)
             W_p = W // (patch_size * spec.tile_size_multiplier)
-            num_tokens = H_p * W_p * T * spec.group_count
+            num_tokens = H_p * W_p * T * num_groups
             spatial_shape = (H_p, W_p)
             temporal_length = T
         elif spec.varies_in_space_only:
@@ -777,7 +811,7 @@ def mask_sample(
                 )
             H_p = H // (patch_size * spec.tile_size_multiplier)
             W_p = W // (patch_size * spec.tile_size_multiplier)
-            num_tokens = H_p * W_p * spec.group_count
+            num_tokens = H_p * W_p * num_groups
             spatial_shape = (H_p, W_p)
             temporal_length = None
         elif spec.varies_in_time_only:
@@ -796,24 +830,44 @@ def mask_sample(
                 raise ValueError(
                     f"Unexpected ndim={data.ndim} for time-only sensor {sensor_label}"
                 )
-            num_tokens = T * spec.group_count
+            num_tokens = T * num_groups
             spatial_shape = None
             temporal_length = T
         else:
-            num_tokens = spec.group_count
+            num_tokens = num_groups
             spatial_shape = None
             temporal_length = None
 
-        # Create mask
-        mask = apply_strategy(
-            strategy,
-            num_tokens,
-            spatial_shape=spatial_shape,
-            temporal_length=temporal_length,
-            num_groups=spec.group_count,
-            step=step,
-            generator=generator,
-        )
+        # Create mask. CrossSensorMasking supports per-sensor "decode-only".
+        #
+        # In SpaceNit we physically *drop* non-visible tokens for the online
+        # encoder (gather). If we make a modality 100% non-visible, its patch
+        # embed parameters would never receive gradients under DDP. To avoid
+        # that degenerate behaviour, we keep a tiny visible fraction so those
+        # parameters are still trained, while making most tokens decoder targets.
+        if isinstance(strategy, CrossSensorMasking) and sensor_label in set(
+            strategy.decode_only_sensors
+        ):
+            # Mostly predicted, with a small visible context fraction.
+            mask = torch.full(
+                (num_tokens,),
+                TokenVisibility.PREDICTED.value,
+                dtype=torch.long,
+            )
+            if num_tokens > 0:
+                n_vis = max(1, int(num_tokens * 0.05))
+                perm = torch.randperm(num_tokens, generator=generator)
+                mask[perm[:n_vis]] = TokenVisibility.VISIBLE_ENCODER.value
+        else:
+            mask = apply_strategy(
+                strategy,
+                num_tokens,
+                spatial_shape=spatial_shape,
+                temporal_length=temporal_length,
+                num_groups=num_groups,
+                step=step,
+                generator=generator,
+            )
 
         # Mark absent data: any token whose underlying data is entirely
         # ABSENT_INDICATOR should be marked ABSENT regardless of the
@@ -822,6 +876,7 @@ def mask_sample(
             ABS = TokenVisibility.ABSENT.value
             _mark_absent_tokens(
                 mask, data, spec, patch_size, ABSENT_INDICATOR, ABS,
+                num_groups=num_groups,
             )
 
         mask_key = f"{sensor_label}_mask"
@@ -893,9 +948,15 @@ class MaskingPolicy(Protocol):
 
 
 class _MaskingPolicyFromStrategy:
-    def __init__(self, strategy: MaskingStrategy) -> None:
+    def __init__(
+        self,
+        strategy: MaskingStrategy,
+        *,
+        tokenization_config: Any | None = None,
+    ) -> None:
         self._strategy = strategy
         self._step = 0
+        self._tokenization_config = tokenization_config
 
     def apply_mask(self, sample: GeoSample, patch_size: int) -> MaskedGeoSample:
         # The ingestion collator passes a *batched* GeoSample. For microbatching
@@ -907,21 +968,27 @@ class _MaskingPolicyFromStrategy:
         # (not once per instance), so scheduled masking behaves as expected.
 
         # Infer batch size robustly: timestamps are (B, T, 3) for batched samples.
+        # Even when B==1, we still want to return *batched* masks (shape (1, N))
+        # because the ingestion pipeline and runners assume dim0 is batch.
         B = 1
+        batched_input = False
         ts = sample.timestamps
         if isinstance(ts, torch.Tensor):
             if ts.ndim == 3:
+                batched_input = True
                 B = int(ts.shape[0])
         elif ts is not None and hasattr(ts, "ndim") and hasattr(ts, "shape"):
             # numpy fallback
             if getattr(ts, "ndim", 0) == 3:
+                batched_input = True
                 B = int(ts.shape[0])
 
-        if B <= 1:
+        if not batched_input:
             masked = mask_sample(
                 sample,
                 self._strategy,
                 patch_size=patch_size,
+                tokenization_config=self._tokenization_config,
                 step=self._step,
                 generator=None,
             )
@@ -961,6 +1028,7 @@ class _MaskingPolicyFromStrategy:
                 GeoSample(**fields),
                 self._strategy,
                 patch_size=patch_size,
+                tokenization_config=self._tokenization_config,
                 step=self._step,
                 generator=None,
             )
@@ -984,7 +1052,11 @@ class _MaskingPolicyFromStrategy:
         return MaskedGeoSample(**out_fields)
 
 
-def build_masking_policy(config: dict[str, Any]) -> MaskingPolicy:
+def build_masking_policy(
+    config: dict[str, Any],
+    *,
+    tokenization_config: Any | None = None,
+) -> MaskingPolicy:
     """Build a dataloader masking policy from a config dict."""
     strategy = build_masking(dict(config))
-    return _MaskingPolicyFromStrategy(strategy)
+    return _MaskingPolicyFromStrategy(strategy, tokenization_config=tokenization_config)

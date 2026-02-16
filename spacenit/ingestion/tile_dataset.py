@@ -600,30 +600,21 @@ class GeoTileDataset(Dataset):
                 standardized_data = self.standardize_image(
                     SensorRegistry.get(sensor_name), sensor_data
                 )
-                # Replace absent pixels/timesteps with 0 after standardization.
-                # Keeping ABSENT_INDICATOR in the model input can cause extreme
-                # activations and NaNs early in training.
-                cleaned = np.where(
-                    missing_mask, 0.0, standardized_data
-                )
-                # Also defensively scrub any NaN/Inf values that may appear
-                # from standardization or raw H5 contents.
+                # Preserve ABSENT_INDICATOR sentinel values so the dataloader-side
+                # masking policy can detect and mark missing tokens as ABSENT
+                # (matching OLMo-Earth).
+                cleaned = np.where(missing_mask, sensor_data, standardized_data)
+                # Defensively scrub NaN/Inf from standardization or raw H5 contents.
+                # (This should not affect ABSENT_INDICATOR values.)
                 cleaned = np.nan_to_num(cleaned, nan=0.0, posinf=0.0, neginf=0.0)
-                sample_dict[sensor_name] = cleaned.astype(self.dtype)
+                sample_dict[sensor_name] = cleaned.astype(self.dtype, copy=False)
 
-        # Regardless of whether we standardized a modality (or skipped it because
-        # it's fully missing), never allow ABSENT_INDICATOR / NaN / Inf into the
-        # model inputs.
+        # Ensure correct dtype and scrub NaN/Inf, but KEEP ABSENT_INDICATOR so
+        # masking can identify missing data.
         for sensor_name, sensor_data in list(sample_dict.items()):
-            if sensor_name == "timestamps":
+            if sensor_name == "timestamps" or sensor_data is None:
                 continue
-            if sensor_data is None:
-                continue
-            # Ensure correct dtype and replace missing sentinel with zeros.
             sensor_data = sensor_data.astype(self.dtype, copy=False)
-            missing_mask = sensor_data == ABSENT_INDICATOR
-            if np.any(missing_mask):
-                sensor_data = np.where(missing_mask, 0.0, sensor_data)
             sensor_data = np.nan_to_num(sensor_data, nan=0.0, posinf=0.0, neginf=0.0)
             sample_dict[sensor_name] = sensor_data.astype(self.dtype, copy=False)
 
